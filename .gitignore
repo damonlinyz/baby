@@ -1,0 +1,33 @@
+# Private runtime data and credentials
+/private/
+/backups/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+*credentials*.json
+*service-account*.json
+
+# Local caches and generated outputs
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+*.log
+coverage/
+.cache/
+dist/
+build/
+clients/weapp/project.private.config.json

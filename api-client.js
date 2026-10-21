@@ -1,0 +1,2 @@
+let csrf='';
+async function api(path,data){const response=await fetch('/api'+path,{method:data?'POST':'GET',credentials:'same-origin',headers:data?{'Content-Type':'application/json','X-CSRF-Token':csrf}:{},body:data?JSON.stringify(data):undefined});let result;try{result=await response.json()}catch{throw Error('服务返回异常，请稍后重试')}if(!response.ok){if(response.status===401)document.dispatchEvent(new CustomEvent('signed-out'));throw Error(result.error||'操作失败')}if(result.csrf)csrf=result.csrf;return result}

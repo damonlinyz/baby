@@ -1,0 +1,358 @@
+"""SQLite domain layer. Mutations run under BEGIN IMMEDIATE; callers supply authenticated actor."""
+import os,json,sqlite3,secrets,hashlib,hmac,time,datetime,contextlib
+import templates
+from pathlib import Path
+ROOT=Path(__file__).resolve().parent.parent
+DB=Path(os.environ.get('BABA_DB',str(ROOT/'private'/'baba.sqlite3')))
+class Problem(Exception):
+ def __init__(self,status,message): self.status=status;self.message=message
+
+def uid(): return secrets.token_hex(12)
+def now(): return int(time.time())
+def today(): return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).date()
+def dumps(x): return json.dumps(x,ensure_ascii=False,separators=(',',':'))
+def text(x,n=200):
+ if not isinstance(x,str) or not x.strip() or len(x)>n: raise Problem(400,'请填写有效内容（最多 %d 字）'%n)
+ return x.strip()
+def date(x):
+ try:return datetime.date.fromisoformat(x)
+ except (TypeError,ValueError):raise Problem(400,'日期格式不正确')
+@contextlib.contextmanager
+def transaction():
+ DB.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+ c=sqlite3.connect(str(DB),timeout=15);c.row_factory=sqlite3.Row;c.execute('PRAGMA foreign_keys=ON');c.execute('PRAGMA busy_timeout=15000')
+ try:
+  c.execute('BEGIN IMMEDIATE');yield c;c.commit()
+ except Exception:c.rollback();raise
+ finally:c.close()
+def init():
+ with transaction() as c:
+  c.executescript('''
+  CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,login TEXT NOT NULL UNIQUE,name TEXT NOT NULL,password TEXT NOT NULL,created INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,csrf TEXT NOT NULL,expires INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS records(kind TEXT NOT NULL,id TEXT NOT NULL,family_id TEXT,body TEXT NOT NULL,version INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(kind,id));
+  CREATE INDEX IF NOT EXISTS records_family ON records(family_id,kind);
+  CREATE TABLE IF NOT EXISTS memberships(family_id TEXT NOT NULL,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,role TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(family_id,user_id));
+  CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,family_id TEXT,actor TEXT,type TEXT,body TEXT,created INTEGER);
+  CREATE TABLE IF NOT EXISTS requests(user_id TEXT NOT NULL,key TEXT NOT NULL,result TEXT NOT NULL,created INTEGER NOT NULL,PRIMARY KEY(user_id,key));
+  CREATE TABLE IF NOT EXISTS payment_events(provider TEXT NOT NULL,event_id TEXT NOT NULL,body_hash TEXT NOT NULL,created INTEGER NOT NULL,PRIMARY KEY(provider,event_id));
+  CREATE TABLE IF NOT EXISTS rate_limits(key TEXT PRIMARY KEY,count INTEGER NOT NULL,window INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+  ''')
+  c.execute("INSERT OR IGNORE INTO metadata VALUES('schema_version','1')")
+ try:os.chmod(DB,0o600)
+ except OSError:pass
+
+def put(c,kind,obj,family_id=None):
+ existing=c.execute('SELECT version FROM records WHERE kind=? AND id=?',(kind,obj['id'])).fetchone()
+ obj=dict(obj);obj['version']=(existing['version']+1) if existing else 1
+ c.execute('INSERT INTO records(kind,id,family_id,body,version) VALUES(?,?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET body=excluded.body,version=excluded.version',(kind,obj['id'],family_id,dumps(obj),obj['version']))
+ return obj
+def get(c,kind,id):
+ row=c.execute('SELECT body FROM records WHERE kind=? AND id=?',(kind,id)).fetchone()
+ if not row:raise Problem(404,'记录不存在')
+ return json.loads(row['body'])
+def rows(c,kind,family_id=None):
+ if family_id is None:rs=c.execute('SELECT body FROM records WHERE kind=?',(kind,))
+ else:rs=c.execute('SELECT body FROM records WHERE kind=? AND family_id=?',(kind,family_id))
+ return [json.loads(r['body']) for r in rs]
+def audit(c,fid,actor,type,body):c.execute('INSERT INTO events VALUES(?,?,?,?,?,?)',(uid(),fid,actor,type,dumps(body),now()))
+def member(c,fid,user,roles=None):
+ m=c.execute('SELECT * FROM memberships WHERE family_id=? AND user_id=? AND active=1',(fid,user)).fetchone()
+ if not m or (roles and m['role'] not in roles):raise Problem(403,'你没有执行此操作的家庭权限')
+ return dict(m)
+def version(obj,data):
+ if data.get('version')!=obj['version']:raise Problem(409,'内容已经更新，请刷新后重试')
+def password_hash(p):
+ if not isinstance(p,str) or len(p)<10 or len(p)>128:raise Problem(400,'密码需要 10—128 个字符')
+ salt=secrets.token_hex(16);derived=hashlib.pbkdf2_hmac('sha256',p.encode(),salt.encode(),600000)
+ return salt+':'+derived.hex()
+def password_ok(p,stored):
+ if not isinstance(p,str) or len(p)>128:return False
+ salt,expected=stored.split(':');return hmac.compare_digest(hashlib.pbkdf2_hmac('sha256',p.encode(),salt.encode(),600000).hex(),expected)
+def rate(c,key,limit,period=60):
+ t=now();r=c.execute('SELECT count,window FROM rate_limits WHERE key=?',(key,)).fetchone()
+ if not r or t-r['window']>=period:c.execute('INSERT OR REPLACE INTO rate_limits VALUES(?,?,?)',(key,1,t))
+ elif r['count']>=limit:raise Problem(429,'操作太频繁，请稍后再试')
+ else:c.execute('UPDATE rate_limits SET count=count+1 WHERE key=?',(key,))
+def auth_register(c,data):
+ login=text(data.get('login'),80).lower();name=text(data.get('name'),30);pw=password_hash(data.get('password'))
+ if c.execute('SELECT id FROM users WHERE login=?',(login,)).fetchone():raise Problem(409,'账号已存在')
+ user=uid();c.execute('INSERT INTO users VALUES(?,?,?,?,?)',(user,login,name,pw,now()));return user
+
+def new_session(c,user):
+ token=secrets.token_urlsafe(40);csrf=secrets.token_urlsafe(24)
+ c.execute('DELETE FROM sessions WHERE expires<?',(now(),));c.execute('INSERT INTO sessions VALUES(?,?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),user,csrf,now()+604800));return token,csrf
+
+def session(c,token):
+ r=c.execute('SELECT user_id,csrf,expires FROM sessions WHERE token_hash=?',(hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
+ if not r or r['expires']<=now():raise Problem(401,'请先登录')
+ return dict(r)
+
+def profile(c,user):
+ u=dict(c.execute('SELECT id,name,login,created FROM users WHERE id=?',(user,)).fetchone());u['families']=[]
+ for m in c.execute('SELECT family_id,role FROM memberships WHERE user_id=? AND active=1',(user,)):
+  f=get(c,'family',m['family_id']);u['families'].append({'id':f['id'],'name':f['name'],'role':m['role']})
+ return u
+
+TASKS=[('一起核对就诊预约和证件','确认日期与机构要求，避免临出门找材料','准备事项'),('安排一次不被打扰的聊天','听听对方今天的感受和需要','陪伴'),('盘点家里已有的用品','先盘点再采购，减少重复购买','准备事项'),('一起讨论本周家务分工','每个人认领一件力所能及的事','协作')]
+ITEMS=[('入院换洗衣物','妈妈入院包','按季节和医院要求准备'),('个人洗漱用品','妈妈入院包','用熟悉的用品更安心'),('舒适防滑拖鞋','妈妈入院包','先核对医院使用要求'),('宝宝换洗衣物','宝宝用品包','适量准备，不大量囤货'),('纸尿裤','宝宝用品包','按实际需要准备'),('柔软毛巾','宝宝用品包','洗净晾干后收好'),('身份证及所需复印件','证件资料包','核对有效期'),('预约与产检资料','证件资料包','由资料本人保管'),('医保相关凭证','证件资料包','核对当地要求')]
+KNOWLEDGE=[('陪伴与沟通','先倾听，再一起想办法','先问“今天哪件事让你觉得辛苦？”听完之后再问，对方想要倾听还是解决办法。把“有事叫我”变成明确分工，可以减少反复沟通。'),('备产准备','待产包从三类开始','先按妈妈用品、宝宝用品、证件资料分类。对照就诊机构要求，盘点已有的，再准备缺少的。不必一次买齐或大量囤货。'),('家庭协作','任务交给具体的人','一项任务指定一个负责人，写清时间和完成标准。需要确认的事项先提交，等待确认后再计入完成。'),('自我照顾','给正在学习的自己一点时间','成为父母需要学习。可以表达不确定，也可以向家人寻求支持。每天做一件具体的小事，同时给彼此留出休息空间。')]
+def create_family(c,user,data):
+ if len(profile(c,user)['families'])>=10:raise Problem(400,'已达到家庭数量上限')
+ fid=uid();f={'id':fid,'name':text(data.get('name'),40),'coordinator':user,'mode':'off','policy_version':1,'created_at':now(),'active_pregnancy_id':None}
+ put(c,'family',f,fid);c.execute('INSERT INTO memberships VALUES(?,?,?,1)',(fid,user,'dad'))
+ for title,note,type in TASKS:put(c,'task',{'id':uid(),'title':title,'note':note,'type':type,'assignee':user,'status':'todo','due_date':None,'completed_at':None,'created_at':now()},fid)
+ for name,pack,note in ITEMS:put(c,'item',{'id':uid(),'name':name,'pack':pack,'note':note,'quantity':1,'assignee':user,'status':'todo','level':'建议'},fid)
+ audit(c,fid,user,'family.created',{});return {'family_id':fid}
+def can_health(c,f,user,p=None):
+ if not p:return False
+ if p['subject_id']==user:return True
+ return any(g['subject']==p['subject_id'] and g['grantee']==user and g['scope']=='health_read' and not g.get('revoked_at') for g in rows(c,'consent',f))
+def can_edit_health(c,f,user,p):
+ if p['subject_id']==user:return True
+ return any(g['subject']==p['subject_id'] and g['grantee']==user and g['scope']=='health_edit' and not g.get('revoked_at') for g in rows(c,'consent',f))
+def notify(c,fid,user,title,ref=None):
+ put(c,'notification',{'id':uid(),'recipient':user,'title':title,'ref':ref,'read':False,'created_at':now()},fid)
+def require_active(c,fid,kind,id):
+ obj=get(c,kind,id)
+ r=c.execute('SELECT family_id FROM records WHERE kind=? AND id=?',(kind,id)).fetchone()
+ if r['family_id']!=fid:raise Problem(403,'记录不属于当前家庭')
+ return obj
+
+def snapshot(c,user,fid):
+ me=member(c,fid,user);f=get(c,'family',fid)
+ members=[dict(r) for r in c.execute('SELECT u.id,u.name,m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.family_id=? AND m.active=1',(fid,))]
+ tasks=rows(c,'task',fid);items=rows(c,'item',fid)
+ tasks=[t for t in tasks if not t.get('private_health_anchor') or can_health(c,fid,user,get(c,'pregnancy',t['pregnancy_id']))]
+ if me['role']=='member':tasks=[t for t in tasks if t['assignee']==user];items=[i for i in items if i['assignee']==user]
+ p=get(c,'pregnancy',f['active_pregnancy_id']) if f.get('active_pregnancy_id') else None
+ if p and not can_health(c,fid,user,p):p={'id':p['id'],'restricted':True}
+ approvals=rows(c,'approval',fid)
+ approvals=[a for a in approvals if me['role'] in ('dad','mom') and (a['approver']==user or a['proposer']==user)]
+ for a in approvals:
+  if a['status']=='pending' and a['expires_at']<=now():
+   a['status']='expired';put(c,'approval',a,fid)
+ appointments=[]
+ for a in rows(c,'appointment',fid):
+  ap=get(c,'pregnancy',a['pregnancy_id']) if a.get('pregnancy_id') else None
+  if a['owner']==user or can_health(c,fid,user,ap):appointments.append(a)
+ knowledge=[k for k in rows(c,'knowledge') if k.get('status')=='published']
+ orders=[o for o in rows(c,'order',fid) if o['payer']==user]
+ return {'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'items':items,'pregnancy':p,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user], 'reminder_preferences':next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==user),{'enabled':True}), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
+def propose(c,fid,user,resource,action,payload,target=None):
+ mom=c.execute("SELECT user_id FROM memberships WHERE family_id=? AND role='mom' AND active=1",(fid,)).fetchone()
+ if not mom:raise Problem(409,'需要妈妈加入家庭后才能启用确认')
+ a={'id':uid(),'resource':resource,'action':action,'target':target,'payload':payload,'proposer':user,'approver':mom['user_id'],'status':'pending','policy_version':get(c,'family',fid)['policy_version'],'created_at':now(),'expires_at':now()+172800}
+ put(c,'approval',a,fid);notify(c,fid,a['approver'],'有一项家庭事务等待你确认',a['id']);return {'pending':True,'approval_id':a['id']}
+def apply_policy(c,fid,value):
+ f=get(c,'family',fid);f['mode']=value;f['policy_version']+=1;put(c,'family',f,fid)
+def complete(c,fid,kind,obj):
+ obj['status']='done';obj['completed_at']=now();return put(c,kind,obj,fid)
+def transition(c,fid,user,p,data):
+ event=data.get('event');d=data.get('date');before=p['state'];allowed={'dating':{'set_edd','end','pause','resume','archive'},'pregnant':{'set_edd','birth','end','pause','resume','archive'},'postpartum':{'correct_birth','pause','resume','archive'},'ended':{'pause','resume','archive'}}
+ if event not in allowed.get(before,set()):raise Problem(409,'当前阶段不支持这项变更')
+ if event=='set_edd':
+  edd=date(d)
+  if edd<today()-datetime.timedelta(days=35) or edd>today()+datetime.timedelta(days=280):raise Problem(400,'预产期超出可录入范围，请核对')
+  p['edd']=d;p['dating_source']=data.get('source','user_entered');p['state']='pregnant';p['dating_revision']=p.get('dating_revision',0)+1
+ elif event in ('birth','correct_birth'):
+  birth=date(d)
+  if birth>today():raise Problem(400,'出生日期不能在未来')
+  if birth<today()-datetime.timedelta(days=730):raise Problem(400,'请核对出生日期')
+  p['birth_date']=d;p['state']='postpartum'
+  if event=='birth':
+   count=data.get('babies',1)
+   if not isinstance(count,int) or count not in (1,2,3):raise Problem(400,'宝宝数量需为 1—3')
+   for i in range(count):put(c,'baby',{'id':uid(),'pregnancy_id':p['id'],'birth_date':d,'name':'宝宝'+(str(i+1) if count>1 else ''),'status':'growing'},fid)
+  else:
+   for b in rows(c,'baby',fid):
+    if b['pregnancy_id']==p['id']:b['birth_date']=d;put(c,'baby',b,fid)
+ elif event=='end':
+  if date(d)>today():raise Problem(400,'结束日期不能在未来')
+  p['end_date']=d;p['state']='ended';p['paused']=True
+ elif event=='pause':p['paused']=True
+ elif event=='resume':p['paused']=False
+ elif event=='archive':p['archived']=True;p['paused']=True
+ p['revision']+=1;put(c,'pregnancy',p,fid);templates.sync(c,fid,p)
+ audit(c,fid,user,'health.transition',{'pregnancy_id':p['id'],'event':event,'before':before,'after':p['state']})
+ if event in ('birth','end','archive','pause'):
+  for n in rows(c,'notification',fid):
+   if n.get('pregnancy_id')==p['id'] and not n['read']:n['cancelled']=True;put(c,'notification',n,fid)
+ if event in ('birth','end'):
+  for t in rows(c,'task',fid):
+   if t.get('pregnancy_id')==p['id'] and t.get('stage')=='pregnant' and t['status']!='done':t['status']='cancelled';put(c,'task',t,fid)
+ return {'state':p['state']}
+
+def mutate(c,user,fid,action,data):
+ me=member(c,fid,user);role=me['role'];f=get(c,'family',fid)
+ if action=='notification.preferences':
+  prefs={'id':fid+'-'+user,'user_id':user,'enabled':data.get('enabled') is True};put(c,'notification_preferences',prefs,fid);return {'ok':True}
+ if action=='ai.activate_gift':
+  gifts=[e for e in rows(c,'entitlement',fid) if e['owner']==user and e['benefit']=='ai_gift' and e['status']=='unactivated']
+  if not gifts:raise Problem(409,'没有待激活的赠送 AI')
+  e=gifts[0];e.update(status='active',starts_at=now(),ends_at=now()+2592000);put(c,'entitlement',e,fid);audit(c,fid,user,action,{});return {'ok':True}
+ if action=='family.update':
+  if role!='dad':raise Problem(403,'只有统筹者可以修改协作设置')
+  version(f,data);mode=data.get('mode',f['mode'])
+  if mode not in ('off','selected','all'):raise Problem(400,'确认模式不正确')
+  if mode!=f['mode'] and f['mode']!='off':return propose(c,fid,user,'family','policy',{'mode':mode,'version':f['version']},fid)
+  if mode!='off' and not c.execute("SELECT 1 FROM memberships WHERE family_id=? AND role='mom' AND active=1",(fid,)).fetchone():raise Problem(409,'妈妈加入后才可启用确认')
+  f['name']=text(data.get('name',f['name']),40);f['mode']=mode;f['policy_version']+=1;put(c,'family',f,fid);audit(c,fid,user,action,{})
+ elif action=='invite.create':
+  if role!='dad':raise Problem(403,'只有统筹者可以邀请家人')
+  r=data.get('role','member')
+  if r not in ('mom','member'):raise Problem(400,'邀请角色无效')
+  token=secrets.token_urlsafe(18);put(c,'invite',{'id':uid(),'token_hash':hashlib.sha256(token.encode()).hexdigest(),'role':r,'expires_at':now()+86400,'used':False},fid);audit(c,fid,user,action,{})
+  return {'invite_code':token,'expires_at':now()+86400}
+ elif action in ('member.remove','member.leave','family.transfer'):
+  target=data.get('user_id') if action!='member.leave' else user
+  if role!='dad' and target!=user:raise Problem(403,'只有统筹者可管理其他成员')
+  target_member=member(c,fid,target)
+  if action=='family.transfer':
+   if role!='dad' or target==user:raise Problem(400,'请选择另一位成员接任')
+   return {'transfer_id':put(c,'transfer',{'id':uid(),'from':user,'to':target,'status':'pending','expires_at':now()+86400},fid)['id']}
+  if target==f['coordinator']:raise Problem(409,'统筹者请先完成转交')
+  c.execute('UPDATE memberships SET active=0 WHERE family_id=? AND user_id=?',(fid,target))
+  for g in rows(c,'consent',fid):
+   if g['subject']==target or g['grantee']==target:g['revoked_at']=now();put(c,'consent',g,fid)
+  if target_member['role']=='mom':apply_policy(c,fid,'off')
+  audit(c,fid,user,action,{'user_id':target})
+ elif action=='transfer.accept':
+  t=require_active(c,fid,'transfer',data.get('id'));version(t,data)
+  if t['to']!=user or t['status']!='pending' or t['expires_at']<now():raise Problem(403,'无法接受该转交')
+  # Preserve mother's role; coordinator is an independent capability.
+  if role=='mom':raise Problem(409,'当前版本不支持妈妈兼任统筹，请转交给其他成员')
+  c.execute("UPDATE memberships SET role='member' WHERE family_id=? AND user_id=?",(fid,t['from']));c.execute("UPDATE memberships SET role='dad' WHERE family_id=? AND user_id=?",(fid,user));f['coordinator']=user;put(c,'family',f,fid);t['status']='accepted';put(c,'transfer',t,fid)
+ elif action in ('task.create','item.create','appointment.create'):
+  if action=='appointment.create':
+   if role not in ('dad','mom'):raise Problem(403,'没有预约管理权限')
+   if f.get('active_pregnancy_id'):
+    p=get(c,'pregnancy',f['active_pregnancy_id'])
+    if not can_edit_health(c,fid,user,p):raise Problem(403,'需要健康资料本人授权代录')
+   elif role!='mom':raise Problem(403,'预约资料需由本人建立健康档案后录入')
+   due=str(date(data.get('date')));obj={'id':uid(),'title':text(data.get('title'),100),'date':due,'note':text(data.get('note') or '以机构实际安排为准',500),'owner':user,'status':'scheduled','pregnancy_id':f.get('active_pregnancy_id'),'reminded':False};put(c,'appointment',obj,fid)
+  else:
+   if role!='dad':raise Problem(403,'只有统筹者可以新建与分配家庭事项')
+   assignee=data.get('assignee') or user;member(c,fid,assignee)
+   due=data.get('due_date') or None
+   if due:date(due)
+   if action=='task.create':obj={'id':uid(),'title':text(data.get('title'),100),'note':str(data.get('note',''))[:500],'type':data.get('type','自定义'),'assignee':assignee,'status':'todo','due_date':due,'created_at':now(),'pregnancy_id':f.get('active_pregnancy_id'),'stage':get(c,'pregnancy',f['active_pregnancy_id'])['state'] if f.get('active_pregnancy_id') else None};put(c,'task',obj,fid)
+   else:obj={'id':uid(),'name':text(data.get('name'),100),'note':str(data.get('note',''))[:500],'pack':data.get('pack','妈妈入院包'),'quantity':max(1,min(100,int(data.get('quantity',1)))),'assignee':assignee,'status':'todo','level':data.get('level','建议')};put(c,'item',obj,fid)
+   if assignee!=user:notify(c,fid,assignee,'你收到一项新的家庭安排')
+  audit(c,fid,user,action,{'id':obj['id']});return {'id':obj['id']}
+ elif action in ('task.update','item.update','appointment.update'):
+  kind=action.split('.')[0];obj=require_active(c,fid,kind,data.get('id'));version(obj,data)
+  if obj.get('private_health_anchor') and not can_health(c,fid,user,get(c,'pregnancy',obj['pregnancy_id'])):raise Problem(403,'此事项包含健康日期，需要本人授权查看')
+  if kind=='appointment':
+   if obj['owner']!=user:raise Problem(403,'只有录入人可修改预约')
+   obj['status']=data.get('status',obj['status'])
+   if obj['status'] not in ('scheduled','done','cancelled'):raise Problem(400,'预约状态不正确')
+  else:
+   desired=data.get('status',obj['status'])
+   if desired not in ('todo','in_progress','done','skipped','cancelled') and not (desired=='pending' and 'status' not in data):raise Problem(400,'状态不正确')
+   if 'assignee' in data or 'due_date' in data or 'title' in data or 'name' in data or 'note' in data:
+    if role!='dad':raise Problem(403,'只有统筹者可以编辑分工与内容')
+    for key in ('title','name','note','due_date','assignee'):
+     if key in data:
+      if key=='assignee':member(c,fid,data[key])
+      if key=='due_date' and data[key]:date(data[key])
+      if key in ('title','name'):text(data[key],100)
+      obj[key]=data[key]
+      if key=='due_date':obj['user_override']=True
+   if desired!=obj['status']:
+    if obj['assignee']!=user:raise Problem(403,'只能提交自己负责事项的执行结果')
+    if desired=='done' and f['mode']!='off' and role!='mom' and (f['mode']=='all' or kind=='task'):
+     result=propose(c,fid,user,kind,'complete',{'version':obj['version']},obj['id']);obj['status']='pending';put(c,kind,obj,fid)
+     # approval must bind the pending resource version.
+     a=get(c,'approval',result['approval_id']);a['payload']['version']=obj['version']+1;put(c,'approval',a,fid);return result
+    obj['status']=desired;obj['completed_at']=now() if desired=='done' else None
+   for a in rows(c,'approval',fid):
+    if a['target']==obj['id'] and a['status']=='pending':a['status']='cancelled';put(c,'approval',a,fid)
+   if obj['status']=='pending':obj['status']='in_progress'
+  put(c,kind,obj,fid);audit(c,fid,user,action,{'id':obj['id']})
+ elif action=='approval.decide':
+  a=require_active(c,fid,'approval',data.get('id'));version(a,data)
+  if a['approver']!=user:raise Problem(403,'只能由指定确认人处理')
+  if a['status']!='pending' or a['expires_at']<now():raise Problem(409,'该确认已失效')
+  decision=data.get('decision')
+  if decision not in ('approved','rejected'):raise Problem(400,'确认结果不正确')
+  if a['resource']=='family':
+   if f['version']!=a['payload']['version']:raise Problem(409,'家庭设置已变更，请重新发起')
+   if decision=='approved':apply_policy(c,fid,a['payload']['mode'])
+  else:
+   obj=require_active(c,fid,a['resource'],a['target'])
+   if obj['version']!=a['payload']['version']:raise Problem(409,'事项内容已变更，请重新提交')
+   if decision=='approved':complete(c,fid,a['resource'],obj)
+   else:obj['status']='in_progress';put(c,a['resource'],obj,fid)
+  a['status']=decision;a['decided_at']=now();a['reason']=str(data.get('reason',''))[:300];put(c,'approval',a,fid);notify(c,fid,a['proposer'],'你的家庭确认申请已有结果');audit(c,fid,user,action,{'id':a['id'],'decision':decision})
+ elif action=='pregnancy.create':
+  if role!='mom':raise Problem(403,'请由妈妈本人建立自己的健康时间轴')
+  if f.get('active_pregnancy_id'):
+   old=get(c,'pregnancy',f['active_pregnancy_id'])
+   if not old.get('archived'):raise Problem(409,'请先归档当前孕次')
+  if data.get('consent') is not True:raise Problem(400,'需要本人单独同意处理健康日期')
+  p={'id':uid(),'subject_id':user,'state':'dating','paused':False,'archived':False,'edd':None,'birth_date':None,'revision':1,'created_at':now()};put(c,'pregnancy',p,fid);f['active_pregnancy_id']=p['id'];put(c,'family',f,fid);audit(c,fid,user,'health.consent',{'purpose':'health_storage','notice_version':'1.0'})
+ elif action=='pregnancy.event':
+  p=require_active(c,fid,'pregnancy',data.get('id'));version(p,data)
+  if not can_edit_health(c,fid,user,p):raise Problem(403,'该健康资料需由本人授权后才能代录')
+  if p.get('archived'):raise Problem(409,'已归档孕次不可修改，请建立新孕次')
+  return transition(c,fid,user,p,data)
+ elif action=='consent.update':
+  if role!='mom':raise Problem(403,'健康资料仅由本人授权')
+  grantee=data.get('grantee');scope=data.get('scope')
+  if scope not in ('health_read','health_edit','ai_context'):raise Problem(400,'授权用途无效')
+  member(c,fid,grantee)
+  if scope=='health_edit' and grantee!=f['coordinator']:raise Problem(400,'代录仅授予家庭统筹者')
+  for g in rows(c,'consent',fid):
+   if g['subject']==user and g['grantee']==grantee and g['scope']==scope and not g.get('revoked_at'):g['revoked_at']=now();put(c,'consent',g,fid)
+  if data.get('enabled') is True:put(c,'consent',{'id':uid(),'subject':user,'grantee':grantee,'scope':scope,'notice_version':'1.0','granted_at':now(),'revoked_at':None},fid)
+  audit(c,fid,user,'health.consent.changed',{'scope':scope,'enabled':data.get('enabled') is True})
+ elif action=='notification.read':
+  n=require_active(c,fid,'notification',data.get('id'))
+  if n['recipient']!=user:raise Problem(403,'无权读取此提醒')
+  n['read']=True;put(c,'notification',n,fid)
+ else:raise Problem(404,'暂不支持此操作')
+ return {'ok':True}
+
+def join(c,user,code):
+ token_hash=hashlib.sha256(text(code,100).encode()).hexdigest()
+ inv=next((i for i in rows(c,'invite') if hmac.compare_digest(i['token_hash'],token_hash)),None)
+ if not inv or inv['used'] or inv['expires_at']<=now():raise Problem(400,'邀请码无效或已过期')
+ row=c.execute("SELECT family_id FROM records WHERE kind='invite' AND id=?",(inv['id'],)).fetchone();fid=row['family_id']
+ if c.execute('SELECT 1 FROM memberships WHERE family_id=? AND user_id=? AND active=1',(fid,user)).fetchone():raise Problem(409,'你已经加入这个家庭')
+ if c.execute('SELECT count(*) FROM memberships WHERE family_id=? AND active=1',(fid,)).fetchone()[0]>=5:raise Problem(409,'家庭最多支持 5 位成员')
+ if inv['role']=='mom' and c.execute("SELECT 1 FROM memberships WHERE family_id=? AND role='mom' AND active=1",(fid,)).fetchone():raise Problem(409,'家庭已绑定妈妈')
+ c.execute('INSERT INTO memberships VALUES(?,?,?,1) ON CONFLICT(family_id,user_id) DO UPDATE SET role=excluded.role,active=1',(fid,user,inv['role']));inv['used']=True;put(c,'invite',inv,fid);audit(c,fid,user,'member.join',{});return {'family_id':fid}
+
+def seed_knowledge(c):
+ for i,(topic,title,body) in enumerate(KNOWLEDGE):
+  if not c.execute("SELECT 1 FROM records WHERE kind='knowledge' AND id=?",('base-'+str(i),)).fetchone():put(c,'knowledge',{'id':'base-'+str(i),'topic':topic,'title':title,'body':body,'status':'published','clinical':False,'source':'产品编辑 · 一般家庭生活内容','source_url':None,'content_version':1,'reviewer':'初始生活内容','published_at':now(),'valid_until':None})
+
+def tick():
+ with transaction() as c:
+  for a in rows(c,'appointment'):
+   if a['status']!='scheduled' or a.get('reminded'):continue
+   if date(a['date'])>today()+datetime.timedelta(days=3):continue
+   r=c.execute("SELECT family_id FROM records WHERE kind='appointment' AND id=?",(a['id'],)).fetchone();fid=r['family_id']
+   p=get(c,'pregnancy',a['pregnancy_id']) if a.get('pregnancy_id') else None
+   if p and (p['paused'] or p['archived'] or p['state']=='ended'):continue
+   if not c.execute('SELECT 1 FROM memberships WHERE family_id=? AND user_id=? AND active=1',(fid,a['owner'])).fetchone():continue
+   n={'id':'appointment-'+a['id'],'recipient':a['owner'],'title':'有一项预约即将到来，请查看安排','ref':a['id'],'pregnancy_id':a.get('pregnancy_id'),'read':False,'created_at':now()}
+   if not c.execute("SELECT 1 FROM records WHERE kind='notification' AND id=?",(n['id'],)).fetchone():put(c,'notification',n,fid)
+   a['reminded']=True;put(c,'appointment',a,fid)
+  for a in rows(c,'approval'):
+   if a['status']=='pending' and a['expires_at']<=now():a['status']='expired';fid=c.execute("SELECT family_id FROM records WHERE kind='approval' AND id=?",(a['id'],)).fetchone()[0];put(c,'approval',a,fid)
+
+  for task in rows(c,'task'):
+   if task['status'] not in ('todo','in_progress') or not task.get('due_date') or date(task['due_date'])>today()+datetime.timedelta(days=1):continue
+   fid=c.execute("SELECT family_id FROM records WHERE kind='task' AND id=?",(task['id'],)).fetchone()[0]
+   if not c.execute('SELECT 1 FROM memberships WHERE family_id=? AND user_id=? AND active=1',(fid,task['assignee'])).fetchone():continue
+   if task.get('pregnancy_id'):
+    p=get(c,'pregnancy',task['pregnancy_id'])
+    if p['paused'] or p['archived'] or p['state']=='ended':continue
+   prefs=next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==task['assignee']),None)
+   if prefs and not prefs['enabled']:continue
+   id='task-'+task['id']+'-'+str(task.get('due_date'))
+   if not c.execute("SELECT 1 FROM records WHERE kind='notification' AND id=?",(id,)).fetchone():
+    put(c,'notification',{'id':id,'recipient':task['assignee'],'title':'有一项家庭安排临近，请查看待办','ref':task['id'],'pregnancy_id':task.get('pregnancy_id'),'read':False,'created_at':now()},fid)
