@@ -175,6 +175,9 @@ class Handler(BaseHTTPRequestHandler):
    if path=='/api/admin/refund/query':self.respond(payments.query_refund(user,data.get('refund_id')));return
    if path=='/api/ai':
     result=ask_ai(user,d.text(data.get('family_id'),64),data.get('question'),d.text(data.get('request_id'),80));self.respond(result);return
+   if path=='/api/pregnancy/preview':
+    with d.transaction() as c:result=d.preview_transition(c,user,d.text(data.get('family_id'),64),data.get('data',{}))
+    self.respond(result);return
    with d.transaction() as c:
     if path=='/api/logout':c.execute('DELETE FROM sessions WHERE token_hash=?',(hashlib.sha256(self.token().encode()).hexdigest(),));result={'ok':True};cookie=self.cookie('',True)
     elif path=='/api/families':result=d.create_family(c,user,data)

@@ -1,4 +1,4 @@
-import unittest,tempfile,subprocess,os,json,urllib.request,urllib.error,socket,time,sys
+import unittest,tempfile,subprocess,os,json,urllib.request,urllib.error,socket,time,sys,datetime
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 class HttpTests(unittest.TestCase):
@@ -68,6 +68,15 @@ class HttpTests(unittest.TestCase):
   inv=act(dt,dc,'invite.create',{'role':'mom'})
   self.assertEqual(self.req('/api/join',{'code':inv['invite_code']},mt,mc)[0],200)
   act(mt,mc,'pregnancy.create',{'consent':True})
+  _,initial=self.req('/api/state?family_id='+fid,token=mt);p=initial['pregnancy']
+  change={'id':p['id'],'version':p['version'],'event':'set_edd','date':str(datetime.date.today()+datetime.timedelta(days=100))}
+  status,preview=self.req('/api/pregnancy/preview',{'family_id':fid,'data':change},mt,mc)
+  self.assertEqual(status,200);self.assertGreater(preview['counts']['created'],0)
+  _,unchanged=self.req('/api/state?family_id='+fid,token=mt)
+  self.assertEqual(unchanged['pregnancy']['state'],'dating')
+  act(mt,mc,'pregnancy.event',dict(change,preview_token=preview['preview_token']))
+  _,changed=self.req('/api/state?family_id='+fid,token=mt)
+  self.assertEqual(changed['pregnancy']['state'],'pregnant');self.assertIn('timeline',changed['pregnancy'])
   for scope in ('health_read','health_edit'):act(mt,mc,'consent.update',{'scope':scope,'grantee':dad['user']['id'],'enabled':True})
   act(dt,dc,'appointment.create',{'title':'合成预约','date':'2026-10-22'})
   _,before=self.req('/api/export?family_id='+fid,token=dt)

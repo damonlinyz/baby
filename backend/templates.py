@@ -37,8 +37,8 @@ def sync(c,fid,p):
    import json
    t=json.loads(row['body'])
    if t['status'] not in ('done','skipped','cancelled') and not t.get('user_override') and t['due_date']!=str(due):
-    d.invalidate_approvals(c,fid,'task',t['id'])
+    d.invalidate_approvals(c,fid,'task',t['id']);d.cancel_notifications(c,fid,t['id'])
     if t['status']=='pending':t['status']='in_progress'
     t['due_date']=str(due);t['anchor_revision']=p['revision'];d.put(c,'task',t,fid)
-  elif due>=d.today()-datetime.timedelta(days=7):
+  elif due>=d.today(d.get(c,'family',fid).get('timezone','Asia/Shanghai'))-datetime.timedelta(days=7):
    d.put(c,'task',{'id':id,'template_key':key,'template_version':1,'pregnancy_id':p['id'],'stage':stage,'title':title,'note':note,'type':category,'assignee':coordinator,'status':'todo','due_date':str(due),'anchor_revision':p['revision'],'private_health_anchor':True,'user_override':False,'created_at':d.now()},fid)
