@@ -163,6 +163,7 @@ def command(c,user,fid,action,key,data):
  if prior:
   if prior['family_id']!=fid or prior['action']!=action or prior['payload_hash']!=digest:raise Problem(409,'请求编号已用于其他内容，请刷新后重试')
   if prior['invalidated']:raise Problem(409,'该请求涉及的资料已清理，请刷新查看当前状态')
+  if action=='pregnancy.event' and not can_edit_health(c,fid,user,require_active(c,fid,'pregnancy',data.get('id'))):raise Problem(403,'该健康资料代录授权已失效')
   return json.loads(prior['result'])
  # Old requests do not contain enough context to prove that a retry is identical.
  if c.execute('SELECT 1 FROM requests WHERE user_id=? AND key=?',(user,key)).fetchone():raise Problem(409,'旧请求无法核对原始内容，请刷新后重试')
@@ -225,7 +226,7 @@ def erase_account(c,user):
    removed.add(t['id']);c.execute("DELETE FROM records WHERE kind='task' AND id=?",(t['id'],))
   else:
    t['pregnancy_id']=None;t['stage']=None;put(c,'task',t,row['family_id'])
- for kind in ('pregnancy','appointment','baby','chat','consent','wechat_identity','notification_preferences','ai_usage','transfer'):
+ for kind in ('pregnancy','pregnancy_event','outbox','appointment','baby','chat','consent','wechat_identity','notification_preferences','ai_usage','transfer'):
   for obj in rows(c,kind):
    if obj.get('pregnancy_id') in owned or obj['id'] in owned or any(obj.get(k)==user for k in ('subject_id','owner','subject','grantee','user_id','from','to')):
     removed.add(obj['id']);c.execute('DELETE FROM records WHERE kind=? AND id=?',(kind,obj['id']))
@@ -300,6 +301,34 @@ def pregnancy_for_event(c,user,fid,data):
  if p.get('archived'):raise Problem(409,'已归档孕次不可修改，请建立新孕次')
  return p
 
+def pregnancy_history(c,user,fid,pid):
+ member(c,fid,user);p=require_active(c,fid,'pregnancy',pid)
+ if not can_health(c,fid,user,p):raise Problem(403,'查看日期修订历史需要本人授权')
+ return sorted((e for e in rows(c,'pregnancy_event',fid) if e['pregnancy_id']==pid),key=lambda e:e['revision'])
+
+def process_outbox(c,fid):
+ pending=[e for e in rows(c,'outbox',fid) if e['status']=='pending' and e.get('available_at',0)<=now()]
+ for event in sorted(pending,key=lambda e:e['created_at'])[:100]:
+  event['attempts']+=1
+  try:
+   p=require_active(c,fid,'pregnancy',event['pregnancy_id'])
+   if p['revision']!=event['pregnancy_revision'] or p.get('paused') or p.get('archived') or p['state']=='ended':
+    event['status']='cancelled'
+   else:
+    sent=0
+    for user in event['recipients']:
+     if not can_health(c,fid,user,p):continue
+     id=event['id']+'-'+user
+     if not c.execute("SELECT 1 FROM records WHERE kind='notification' AND id=?",(id,)).fetchone():
+      put(c,'notification',{'id':id,'recipient':user,'title':'时间轴安排已更新，请查看待办','ref':event['event_id'],'pregnancy_id':p['id'],'read':False,'created_at':now()},fid)
+     sent+=1
+    event['status']='sent' if sent else 'cancelled'
+   event['processed_at']=now()
+  except Problem:
+   event['status']='failed' if event['attempts']>=3 else 'pending'
+   event['available_at']=now()+30*event['attempts']
+  put(c,'outbox',event,fid)
+
 def transition_fingerprint(c,user,fid,data):
  payload={k:v for k,v in data.items() if k!='preview_token'}
  state=[dict(r) for r in c.execute('SELECT kind,id,body,version FROM records WHERE family_id=? ORDER BY kind,id',(fid,))]
@@ -333,6 +362,7 @@ def preview_transition(c,user,fid,data):
  return result
 
 def transition(c,fid,user,p,data):
+ before_record=dict(p)
  event=data.get('event');d=data.get('date');before=p['state'];before_revision=p['revision'];allowed={'dating':{'set_edd','set_lmp','end','pause','resume','archive'},'pregnant':{'set_edd','set_lmp','birth','end','pause','resume','archive'},'postpartum':{'correct_birth','pause','resume','archive'},'ended':{'pause','resume','archive'}}
  current=today(get(c,'family',fid).get('timezone',dates.DEFAULT_TIMEZONE))
  if event not in allowed.get(before,set()):raise Problem(409,'当前阶段不支持这项变更')
@@ -377,7 +407,12 @@ def transition(c,fid,user,p,data):
   for t in rows(c,'task',fid):
    if t.get('pregnancy_id')==p['id'] and t.get('stage')=='pregnant' and t['status'] not in ('done','skipped','cancelled'):
     invalidate_approvals(c,fid,'task',t['id']);t['status']='cancelled';put(c,'task',t,fid)
- return {'state':p['state']}
+ event_id=uid();after=get(c,'pregnancy',p['id'])
+ put(c,'pregnancy_event',{'id':event_id,'pregnancy_id':p['id'],'actor':user,'event':event,'before':before_record,'after':after,'revision':p['revision'],'effective_date':d if event in ('set_edd','set_lmp','birth','correct_birth','end') else str(current),'reason':reason.strip(),'created_at':now()},fid)
+ if event in ('set_edd','set_lmp','birth','correct_birth'):
+  recipients=[r['user_id'] for r in c.execute('SELECT user_id FROM memberships WHERE family_id=? AND active=1',(fid,)) if can_health(c,fid,r['user_id'],after)]
+  put(c,'outbox',{'id':'timeline-'+event_id,'event_id':event_id,'pregnancy_id':p['id'],'pregnancy_revision':p['revision'],'recipients':recipients,'status':'pending','attempts':0,'created_at':now(),'available_at':now()},fid)
+ return {'state':p['state'],'event_id':event_id}
 
 def mutate(c,user,fid,action,data):
  me=member(c,fid,user);role=me['role'];f=get(c,'family',fid)
@@ -601,7 +636,7 @@ def tick():
    n={'id':key,'recipient':a['owner'],'title':'有一项预约即将到来，请查看安排','ref':a['id'],'pregnancy_id':a.get('pregnancy_id'),'read':False,'created_at':now()}
    if not c.execute("SELECT 1 FROM records WHERE kind='notification' AND id=?",(n['id'],)).fetchone():put(c,'notification',n,fid)
    a['reminded']=True;put(c,'appointment',a,fid)
-  for f in rows(c,'family'):expire_approvals(c,f['id'])
+  for f in rows(c,'family'):expire_approvals(c,f['id']);process_outbox(c,f['id'])
 
   for task in rows(c,'task'):
    if task['status'] not in ('todo','in_progress') or not task.get('due_date'):continue

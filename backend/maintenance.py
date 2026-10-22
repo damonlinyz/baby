@@ -116,6 +116,10 @@ def restore(snapshot, ledger, output):
                     for family in d.rows(recovered, 'family'):
                         fid = family['id']
                         d.cancel_transfers(recovered, fid)
+                        for pending in d.rows(recovered, 'outbox', fid):
+                            if pending['status'] == 'pending':
+                                pending['status'] = 'cancelled'
+                                d.put(recovered, 'outbox', pending, fid)
                         for member in recovered.execute('SELECT user_id FROM memberships WHERE family_id=?', (fid,)).fetchall():
                             d.cancel_member_approvals(recovered, fid, member[0])
                         for grant in d.rows(recovered, 'consent', fid):

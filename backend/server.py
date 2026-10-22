@@ -125,17 +125,20 @@ class Handler(BaseHTTPRequestHandler):
    if path in STATIC:
     p=ROOT/STATIC[path];ct='text/html; charset=utf-8' if p.suffix=='.html' else 'text/css; charset=utf-8' if p.suffix=='.css' else 'application/javascript; charset=utf-8';self.respond(p.read_bytes(),content_type=ct);return
    if path=='/api/health':self.respond({'ok':True,'schema_version':1,'integrations':integrations()});return
-   if path not in ('/api/me','/api/state','/api/admin','/api/products','/api/export','/api/audit'):raise d.Problem(404,'接口不存在')
+   if path not in ('/api/me','/api/state','/api/admin','/api/products','/api/export','/api/audit','/api/pregnancy/history'):raise d.Problem(404,'接口不存在')
    with d.transaction() as c:
     s=self.identity(c);user=s['user_id']
     if path=='/api/me':result={'user':d.profile(c,user),'csrf':s['csrf'],'integrations':integrations()}
     elif path=='/api/state':result=d.snapshot(c,user,q.get('family_id',[''])[0]);result['integrations']=integrations()
+    elif path=='/api/pregnancy/history':result={'events':d.pregnancy_history(c,user,q.get('family_id',[''])[0],q.get('pregnancy_id',[''])[0])}
     elif path=='/api/admin':
      if user!=os.environ.get('ADMIN_USER_ID'):raise d.Problem(403,'需要系统管理员权限')
      result={'knowledge':d.rows(c,'knowledge'),'knowledge_versions':d.rows(c,'knowledge_version'),'refunds':d.rows(c,'refund')}
     elif path=='/api/products':result={'products':PRODUCTS,'integrations':integrations()}
     elif path=='/api/export':
-     fid=q.get('family_id',[''])[0];result=d.snapshot(c,user,fid);result.pop('consents',None);d.audit(c,fid,user,'data.export',{})
+     fid=q.get('family_id',[''])[0];result=d.snapshot(c,user,fid);result.pop('consents',None)
+     result['pregnancy_events']=[e for e in d.rows(c,'pregnancy_event',fid) if d.can_health(c,fid,user,d.get(c,'pregnancy',e['pregnancy_id']))]
+     d.audit(c,fid,user,'data.export',{})
     elif path=='/api/audit':
      fid=q.get('family_id',[''])[0];d.member(c,fid,user,('dad',));result={'events':[dict(r) for r in c.execute("SELECT id,actor,type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 100",(fid,))]}
     else:raise d.Problem(404,'接口不存在')
