@@ -91,7 +91,7 @@ def session(c,token):
  return dict(r)
 
 def profile(c,user):
- u=dict(c.execute('SELECT id,name,login,created FROM users WHERE id=?',(user,)).fetchone());u['families']=[]
+ u=dict(c.execute('SELECT id,name,login,created FROM users WHERE id=?',(user,)).fetchone());u['families']=[];u['is_system_admin']=user==os.environ.get('ADMIN_USER_ID')
  for m in c.execute('SELECT family_id,role FROM memberships WHERE user_id=? AND active=1',(user,)):
   f=get(c,'family',m['family_id']);u['families'].append({'id':f['id'],'name':f['name'],'role':m['role']})
  return u
@@ -142,7 +142,7 @@ def expire_approvals(c,fid):
 def clean_health_access(c,fid):
  # A revoked grant must not leave a queued reminder or a completion request usable.
  for n in rows(c,'notification',fid):
-  if n.get('pregnancy_id') and not can_health(c,fid,n['recipient'],get(c,'pregnancy',n['pregnancy_id'])):
+  if n.get('pregnancy_id') and n.get('health_sensitive',True) and not can_health(c,fid,n['recipient'],get(c,'pregnancy',n['pregnancy_id'])):
    if not n.get('cancelled'):n['cancelled']=True;put(c,'notification',n,fid)
  for a in rows(c,'approval',fid):
   if a['status']!='pending' or a['resource'] not in ('task','item'):continue
@@ -239,9 +239,9 @@ def snapshot(c,user,fid):
  for a in rows(c,'appointment',fid):
   ap=get(c,'pregnancy',a['pregnancy_id']) if a.get('pregnancy_id') else None
   if can_health(c,fid,user,ap) or (not ap and a['owner']==user):appointments.append(a)
- knowledge=[k for k in rows(c,'knowledge') if k.get('status')=='published']
+ knowledge=published_knowledge(c)
  orders=[o for o in rows(c,'order',fid) if o['payer']==user]
- return {'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'items':items,'pregnancy':p,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and (not n.get('pregnancy_id') or can_health(c,fid,user,get(c,'pregnancy',n['pregnancy_id'])))], 'reminder_preferences':next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==user),{'enabled':True}), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
+ return {'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'items':items,'pregnancy':p,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and (not n.get('pregnancy_id') or n.get('health_sensitive') is False or can_health(c,fid,user,get(c,'pregnancy',n['pregnancy_id'])))], 'reminder_preferences':next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==user),{'enabled':True}), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
 def propose(c,fid,user,resource,action,payload,target=None):
  mom=c.execute("SELECT user_id FROM memberships WHERE family_id=? AND role='mom' AND active=1",(fid,)).fetchone()
  if not mom:raise Problem(409,'需要妈妈加入家庭后才能启用确认')
@@ -256,12 +256,17 @@ def apply_policy(c,fid,value):
    obj=require_active(c,fid,a['resource'],a['target'])
    if obj['status']=='pending':obj['status']='in_progress';put(c,a['resource'],obj,fid)
 def complete(c,fid,kind,obj):
- obj['status']='done';obj['completed_at']=now();return put(c,kind,obj,fid)
+ obj['status']='done';obj['completed_at']=now();reset_reminder(c,fid,obj);return put(c,kind,obj,fid)
 
 def cancel_notifications(c,fid,ref):
  for n in rows(c,'notification',fid):
   if n.get('ref')==ref and not n['read'] and not n.get('cancelled'):
    n['cancelled']=True;put(c,'notification',n,fid)
+
+def reset_reminder(c,fid,obj):
+ cancel_notifications(c,fid,obj['id'])
+ obj['reminder_revision']=obj.get('reminder_revision',0)+1
+ if 'reminded' in obj:obj['reminded']=False
 
 def pregnancy_for_event(c,user,fid,data):
  member(c,fid,user)
@@ -344,7 +349,12 @@ def transition(c,fid,user,p,data):
 def mutate(c,user,fid,action,data):
  me=member(c,fid,user);role=me['role'];f=get(c,'family',fid)
  if action=='notification.preferences':
-  prefs={'id':fid+'-'+user,'user_id':user,'enabled':data.get('enabled') is True};put(c,'notification_preferences',prefs,fid);return {'ok':True}
+  prefs={'id':fid+'-'+user,'user_id':user,'enabled':data.get('enabled') is True};put(c,'notification_preferences',prefs,fid)
+  if not prefs['enabled']:
+   task_ids={t['id'] for t in rows(c,'task',fid)}
+   for n in rows(c,'notification',fid):
+    if n['recipient']==user and n.get('ref') in task_ids and not n['read'] and not n.get('cancelled'):n['cancelled']=True;put(c,'notification',n,fid)
+  return {'ok':True}
  if action=='ai.activate_gift':
   gifts=[e for e in rows(c,'entitlement',fid) if e['owner']==user and e['benefit']=='ai_gift' and e['status']=='unactivated']
   if not gifts:raise Problem(409,'没有待激活的赠送 AI')
@@ -416,13 +426,17 @@ def mutate(c,user,fid,action,data):
    if assignee!=user:notify(c,fid,assignee,'你收到一项新的家庭安排')
   audit(c,fid,user,action,{'id':obj['id']});return {'id':obj['id']}
  elif action in ('task.update','item.update','appointment.update'):
-  kind=action.split('.')[0];obj=require_active(c,fid,kind,data.get('id'));version(obj,data)
+  kind=action.split('.')[0];obj=require_active(c,fid,kind,data.get('id'));version(obj,data);original=dict(obj)
   if obj.get('private_health_anchor') and not can_health(c,fid,user,get(c,'pregnancy',obj['pregnancy_id'])):raise Problem(403,'此事项包含健康日期，需要本人授权查看')
   if kind=='appointment':
    if obj['owner']!=user:raise Problem(403,'只有录入人可修改预约')
    if obj.get('pregnancy_id') and not can_edit_health(c,fid,user,get(c,'pregnancy',obj['pregnancy_id'])):raise Problem(403,'健康资料代录授权已失效')
    obj['status']=data.get('status',obj['status'])
    if obj['status'] not in ('scheduled','done','cancelled'):raise Problem(400,'预约状态不正确')
+   if 'date' in data:obj['date']=str(date(data['date']))
+   if 'title' in data:obj['title']=text(data['title'],100)
+   if 'note' in data:obj['note']=text(data['note'] or '以机构实际安排为准',500)
+   if obj['date']!=original['date'] or obj['status']!=original['status']:reset_reminder(c,fid,obj)
   else:
    desired=data.get('status',obj['status'])
    if desired not in ('todo','in_progress','done','skipped','cancelled') and not (desired=='pending' and 'status' not in data):raise Problem(400,'状态不正确')
@@ -438,13 +452,14 @@ def mutate(c,user,fid,action,data):
    if desired!=obj['status']:
     if obj['assignee']!=user:raise Problem(403,'只能提交自己负责事项的执行结果')
     if desired=='done' and f['mode']!='off' and role!='mom' and (f['mode']=='all' or kind=='task'):
-     result=propose(c,fid,user,kind,'complete',{'version':obj['version']},obj['id']);obj['status']='pending';put(c,kind,obj,fid)
+     result=propose(c,fid,user,kind,'complete',{'version':obj['version']},obj['id']);obj['status']='pending';reset_reminder(c,fid,obj);put(c,kind,obj,fid)
      # approval must bind the pending resource version.
      a=get(c,'approval',result['approval_id']);a['payload']['version']=obj['version']+1;put(c,'approval',a,fid);return result
     obj['status']=desired;obj['completed_at']=now() if desired=='done' else None
    for a in rows(c,'approval',fid):
     if a['target']==obj['id'] and a['status']=='pending':a['status']='cancelled';put(c,'approval',a,fid)
    if obj['status']=='pending':obj['status']='in_progress'
+   if any(obj.get(k)!=original.get(k) for k in ('status','assignee','due_date')):reset_reminder(c,fid,obj)
   put(c,kind,obj,fid);audit(c,fid,user,action,{'id':obj['id']})
  elif action=='approval.decide':
   a=require_active(c,fid,'approval',data.get('id'));version(a,data)
@@ -506,24 +521,60 @@ def seed_knowledge(c):
  for i,(topic,title,body) in enumerate(KNOWLEDGE):
   if not c.execute("SELECT 1 FROM records WHERE kind='knowledge' AND id=?",('base-'+str(i),)).fetchone():put(c,'knowledge',{'id':'base-'+str(i),'topic':topic,'title':title,'body':body,'status':'published','clinical':False,'source':'产品编辑 · 一般家庭生活内容','source_url':None,'content_version':1,'reviewer':'初始生活内容','published_at':now(),'valid_until':None})
 
+def published_knowledge(c):
+ result=[]
+ for k in rows(c,'knowledge'):
+  if k.get('status')!='published' or k.get('clinical'):continue
+  until=k.get('valid_until')
+  if until:
+   try:
+    if date(until)<today():continue
+   except Problem:continue
+  result.append(k)
+ return result
+
+def citations_current(c,result):
+ current={k['id']:k['content_version'] for k in published_knowledge(c)}
+ return all(current.get(ref['id'])==ref['version'] for ref in result.get('citations',[]))
+
+def publish_knowledge(c,user,data):
+ if user!=os.environ.get('ADMIN_USER_ID'):raise Problem(403,'需要系统内容管理员权限')
+ if data.get('clinical'):raise Problem(409,'本版不发布医疗生成知识，请先完成专业审校发布流程')
+ id=data.get('id') or uid();old=get(c,'knowledge',id) if data.get('id') else None
+ if old:version(old,data)
+ status=data.get('status','draft')
+ if status not in ('draft','published','retired'):raise Problem(400,'内容状态不正确')
+ until=data.get('valid_until',old.get('valid_until') if old else None) or None
+ if until:
+  until=str(date(until))
+  if status=='published' and date(until)<today():raise Problem(400,'不能发布已过有效期的知识')
+ k={'id':id,'title':text(data.get('title'),100),'body':text(data.get('body'),20000),'topic':text(data.get('topic'),40),'clinical':False,'source':text(data.get('source'),300),'content_version':old['content_version']+1 if old else 1,'status':status,'reviewer':user,'published_at':now() if status=='published' else None,'valid_until':until}
+ put(c,'knowledge_version',dict(k,id=id+'-v'+str(k['content_version']),knowledge_id=id))
+ put(c,'knowledge',k);audit(c,None,user,'knowledge.'+status,{'id':id,'content_version':k['content_version']})
+ return {'id':id}
+
 def tick():
  with transaction() as c:
   for a in rows(c,'appointment'):
    if a['status']!='scheduled' or a.get('reminded'):continue
-   if not today()<=date(a['date'])<=today()+datetime.timedelta(days=3):continue
    r=c.execute("SELECT family_id FROM records WHERE kind='appointment' AND id=?",(a['id'],)).fetchone();fid=r['family_id']
+   current=today(get(c,'family',fid).get('timezone',dates.DEFAULT_TIMEZONE))
+   if not current<=date(a['date'])<=current+datetime.timedelta(days=3):continue
    p=get(c,'pregnancy',a['pregnancy_id']) if a.get('pregnancy_id') else None
    if p and (p['paused'] or p['archived'] or p['state']=='ended'):continue
    if p and not can_health(c,fid,a['owner'],p):continue
    if not c.execute('SELECT 1 FROM memberships WHERE family_id=? AND user_id=? AND active=1',(fid,a['owner'])).fetchone():continue
-   n={'id':'appointment-'+a['id'],'recipient':a['owner'],'title':'有一项预约即将到来，请查看安排','ref':a['id'],'pregnancy_id':a.get('pregnancy_id'),'read':False,'created_at':now()}
+   key='appointment-'+a['id']+('-r'+str(a['reminder_revision']) if a.get('reminder_revision') else '')
+   n={'id':key,'recipient':a['owner'],'title':'有一项预约即将到来，请查看安排','ref':a['id'],'pregnancy_id':a.get('pregnancy_id'),'read':False,'created_at':now()}
    if not c.execute("SELECT 1 FROM records WHERE kind='notification' AND id=?",(n['id'],)).fetchone():put(c,'notification',n,fid)
    a['reminded']=True;put(c,'appointment',a,fid)
   for f in rows(c,'family'):expire_approvals(c,f['id'])
 
   for task in rows(c,'task'):
-   if task['status'] not in ('todo','in_progress') or not task.get('due_date') or date(task['due_date'])>today()+datetime.timedelta(days=1):continue
+   if task['status'] not in ('todo','in_progress') or not task.get('due_date'):continue
    fid=c.execute("SELECT family_id FROM records WHERE kind='task' AND id=?",(task['id'],)).fetchone()[0]
+   current=today(get(c,'family',fid).get('timezone',dates.DEFAULT_TIMEZONE))
+   if not current<=date(task['due_date'])<=current+datetime.timedelta(days=1):continue
    if not c.execute('SELECT 1 FROM memberships WHERE family_id=? AND user_id=? AND active=1',(fid,task['assignee'])).fetchone():continue
    if task.get('pregnancy_id'):
     p=get(c,'pregnancy',task['pregnancy_id'])
@@ -531,6 +582,6 @@ def tick():
     if task.get('private_health_anchor') and not can_health(c,fid,task['assignee'],p):continue
    prefs=next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==task['assignee']),None)
    if prefs and not prefs['enabled']:continue
-   id='task-'+task['id']+'-'+str(task.get('due_date'))
+   id='task-'+task['id']+'-'+str(task.get('due_date'))+('-r'+str(task['reminder_revision']) if task.get('reminder_revision') else '')
    if not c.execute("SELECT 1 FROM records WHERE kind='notification' AND id=?",(id,)).fetchone():
-    put(c,'notification',{'id':id,'recipient':task['assignee'],'title':'有一项家庭安排临近，请查看待办','ref':task['id'],'pregnancy_id':task.get('pregnancy_id'),'read':False,'created_at':now()},fid)
+    put(c,'notification',{'id':id,'recipient':task['assignee'],'title':'有一项家庭安排临近，请查看待办','ref':task['id'],'pregnancy_id':task.get('pregnancy_id'),'health_sensitive':bool(task.get('private_health_anchor')),'read':False,'created_at':now()},fid)

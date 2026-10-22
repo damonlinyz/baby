@@ -30,8 +30,12 @@ def ask_ai(user,fid,question,request_id):
  with d.transaction() as c:
   d.member(c,fid,user,('dad',));d.rate(c,'ai:'+user,20,3600)
   existing=c.execute('SELECT result FROM requests WHERE user_id=? AND key=?',(user,'ai:'+request_id)).fetchone()
-  if existing:return json.loads(existing['result'])
-  knowledge=[k for k in d.rows(c,'knowledge') if k['status']=='published' and not k.get('clinical')]
+  if existing:
+   result=json.loads(existing['result'])
+   if not d.citations_current(c,result):raise d.Problem(409,'参考内容已更新或撤回，请重新提问')
+   return result
+  knowledge=d.published_knowledge(c)
+  if not knowledge:return {'answer':'当前没有有效的已发布生活知识，暂不生成回答。你仍可管理家庭任务和预约。','kind':'knowledge','citations':[]}
   words=[question[i:i+2] for i in range(max(0,len(question)-1))];ranked=sorted(knowledge,key=lambda k:sum(w in k['title']+k['body'] for w in words),reverse=True)[:3]
   if not integrations()['ai']:
    return {'answer':'当前尚未配置 AI 服务。你可以先参考已发布的生活知识：\n\n'+'\n\n'.join(k['title']+'：'+k['body'] for k in ranked),'kind':'knowledge','citations':[{'id':k['id'],'title':k['title'],'version':k['content_version']} for k in ranked]}
@@ -60,7 +64,9 @@ def ask_ai(user,fid,question,request_id):
   if any(w in answer for w in ('服用','毫克','mg/kg','诊断为','肯定健康','一定安全')):raise ValueError('output policy rejected')
   result={'answer':answer,'kind':'ai','citations':[{'id':k['id'],'title':k['title'],'version':k['content_version']} for k in ranked]}
   with d.transaction() as c:
-   d.member(c,fid,user,('dad',));usage=d.get(c,'ai_usage',usage_id);usage['status']='committed';usage['tokens']=body.get('usage',{});d.put(c,'ai_usage',usage,fid)
+   d.member(c,fid,user,('dad',))
+   if not d.citations_current(c,result):raise d.Problem(409,'参考内容已更新或撤回，请重新提问')
+   usage=d.get(c,'ai_usage',usage_id);usage['status']='committed';usage['tokens']=body.get('usage',{});d.put(c,'ai_usage',usage,fid)
    c.execute('INSERT OR IGNORE INTO requests VALUES(?,?,?,?)',(user,'ai:'+request_id,d.dumps(result),d.now()))
   return result
  except Exception:
@@ -108,7 +114,7 @@ class Handler(BaseHTTPRequestHandler):
     elif path=='/api/state':result=d.snapshot(c,user,q.get('family_id',[''])[0]);result['integrations']=integrations()
     elif path=='/api/admin':
      if user!=os.environ.get('ADMIN_USER_ID'):raise d.Problem(403,'需要系统管理员权限')
-     result={'knowledge':d.rows(c,'knowledge'),'refunds':d.rows(c,'refund')}
+     result={'knowledge':d.rows(c,'knowledge'),'knowledge_versions':d.rows(c,'knowledge_version'),'refunds':d.rows(c,'refund')}
     elif path=='/api/products':result={'products':PRODUCTS,'integrations':integrations()}
     elif path=='/api/export':
      fid=q.get('family_id',[''])[0];result=d.snapshot(c,user,fid);result.pop('consents',None);d.audit(c,fid,user,'data.export',{})
@@ -186,15 +192,7 @@ class Handler(BaseHTTPRequestHandler):
      fid=d.text(data.get('family_id'),64);action=d.text(data.get('action'),80);key=d.text(data.get('request_id'),80)
      result=d.command(c,user,fid,action,key,data.get('data',{}))
     elif path=='/api/knowledge':
-     # Local operator role is configured outside the web UI. A family coordinator is not a medical reviewer.
-     if user!=os.environ.get('ADMIN_USER_ID'):raise d.Problem(403,'需要系统内容管理员权限')
-     if data.get('clinical'):raise d.Problem(409,'本版不发布医疗生成知识，请先完成专业审校发布流程')
-     id=data.get('id') or d.uid();old=d.get(c,'knowledge',id) if data.get('id') else None
-     if old:d.version(old,data)
-     status=data.get('status','draft')
-     if status not in ('draft','published','retired'):raise d.Problem(400,'内容状态不正确')
-     k={'id':id,'title':d.text(data.get('title'),100),'body':d.text(data.get('body'),20000),'topic':d.text(data.get('topic'),40),'clinical':False,'source':d.text(data.get('source'),300),'content_version':old['content_version']+1 if old else 1,'status':status,'reviewer':user,'published_at':d.now()}
-     d.put(c,'knowledge_version',dict(k,id=id+'-v'+str(k['content_version'])));d.put(c,'knowledge',k);result={'id':id}
+     result=d.publish_knowledge(c,user,data)
     elif path=='/api/orders':
      d.member(c,data.get('family_id'),user,('dad',));raise d.Problem(503,'支付尚未配置，不会创建假订单或授予虚假权益；本机自用不收费')
     elif path=='/api/account/delete':

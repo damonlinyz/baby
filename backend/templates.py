@@ -37,7 +37,7 @@ def sync(c,fid,p):
    import json
    t=json.loads(row['body'])
    if t['status'] not in ('done','skipped','cancelled') and not t.get('user_override') and t['due_date']!=str(due):
-    d.invalidate_approvals(c,fid,'task',t['id']);d.cancel_notifications(c,fid,t['id'])
+    d.invalidate_approvals(c,fid,'task',t['id']);d.reset_reminder(c,fid,t)
     if t['status']=='pending':t['status']='in_progress'
     t['due_date']=str(due);t['anchor_revision']=p['revision'];d.put(c,'task',t,fid)
   elif due>=d.today(d.get(c,'family',fid).get('timezone','Asia/Shanghai'))-datetime.timedelta(days=7):
