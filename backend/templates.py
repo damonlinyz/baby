@@ -23,12 +23,13 @@ TEMPLATES=[
  ('growth-archive','postpartum',180,'整理半年里想保存的小事','照片和记录需尊重家人意愿','陪伴'),
  ('birthday-plan','postpartum',350,'一起计划简简单单的周岁纪念','回顾陪伴与成长，不必攀比','陪伴')]
 def sync(c,fid,p):
- import domain as d,datetime,hashlib
+ import domain as d,datetime,hashlib,lifecycle
  if p.get('archived') or p['state'] in ('dating','ended'):return
  anchor=d.date(p['edd'] if p['state']=='pregnant' else p['birth_date'])
  coordinator=d.get(c,'family',fid)['coordinator']
  for key,stage,offset,title,note,category in TEMPLATES:
   if stage!=p['state']:continue
+  if key in lifecycle.QUIET_TEMPLATE_KEYS and lifecycle.quiet(c,fid,p['id']):continue
   due=anchor+datetime.timedelta(days=offset)
   # Avoid flooding a newly recorded pregnancy with past dates; existing history is never altered.
   id='auto-'+hashlib.sha256((p['id']+key).encode()).hexdigest()[:24]

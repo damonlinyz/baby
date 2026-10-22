@@ -1,6 +1,6 @@
 """SQLite domain layer. Mutations run under BEGIN IMMEDIATE; callers supply authenticated actor."""
 import os,json,sqlite3,secrets,hashlib,hmac,time,datetime,contextlib
-import templates,dates
+import templates,dates,lifecycle
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent.parent
 DB=Path(os.environ.get('BABA_DB',str(ROOT/'private'/'baba.sqlite3')))
@@ -120,6 +120,14 @@ def can_edit_health(c,f,user,p):
  return any(g['subject']==p['subject_id'] and g['grantee']==user and g['scope']=='health_edit' and not g.get('revoked_at') for g in rows(c,'consent',f))
 def health_members_active(c,fid,user,p):
  return all(c.execute('SELECT 1 FROM memberships WHERE family_id=? AND user_id=? AND active=1',(fid,u)).fetchone() for u in {user,p['subject_id']})
+def can_view_task(c,fid,user,task):
+ p=get(c,'pregnancy',task['pregnancy_id']) if task.get('pregnancy_id') else None
+ if task.get('private_health_anchor') and not can_health(c,fid,user,p):return False
+ return task.get('template_key') not in lifecycle.BABY_TEMPLATE_KEYS or lifecycle.can_read_babies(c,fid,user,p)
+def can_view_notification(c,fid,user,n):
+ if n.get('pregnancy_id') and n.get('health_sensitive',True) and not can_health(c,fid,user,get(c,'pregnancy',n['pregnancy_id'])):return False
+ row=c.execute("SELECT body FROM records WHERE kind='task' AND id=?",(n.get('ref'),)).fetchone()
+ return not row or can_view_task(c,fid,user,json.loads(row['body']))
 def notify(c,fid,user,title,ref=None):
  put(c,'notification',{'id':uid(),'recipient':user,'title':title,'ref':ref,'read':False,'created_at':now()},fid)
 def require_active(c,fid,kind,id):
@@ -145,14 +153,14 @@ def expire_approvals(c,fid):
 def clean_health_access(c,fid):
  # A revoked grant must not leave a queued reminder or a completion request usable.
  for n in rows(c,'notification',fid):
-  if n.get('pregnancy_id') and n.get('health_sensitive',True) and not can_health(c,fid,n['recipient'],get(c,'pregnancy',n['pregnancy_id'])):
+  if not can_view_notification(c,fid,n['recipient'],n):
    if not n.get('cancelled'):n['cancelled']=True;put(c,'notification',n,fid)
  for a in rows(c,'approval',fid):
   if a['status']!='pending' or a['resource'] not in ('task','item'):continue
   obj=require_active(c,fid,a['resource'],a['target'])
   if obj.get('private_health_anchor'):
    p=get(c,'pregnancy',obj['pregnancy_id'])
-   if not all(can_health(c,fid,u,p) for u in (a['proposer'],a['approver'])):
+   if not all(can_view_task(c,fid,u,obj) for u in (a['proposer'],a['approver'])):
     a['status']='cancelled';put(c,'approval',a,fid)
     if obj['status']=='pending':obj['status']='in_progress';put(c,a['resource'],obj,fid)
 
@@ -165,6 +173,9 @@ def command(c,user,fid,action,key,data):
   if prior['family_id']!=fid or prior['action']!=action or prior['payload_hash']!=digest:raise Problem(409,'请求编号已用于其他内容，请刷新后重试')
   if prior['invalidated']:raise Problem(409,'该请求涉及的资料已清理，请刷新查看当前状态')
   if action=='pregnancy.event' and not can_edit_health(c,fid,user,require_active(c,fid,'pregnancy',data.get('id'))):raise Problem(403,'该健康资料代录授权已失效')
+  if action=='baby.update':
+   baby=require_active(c,fid,'baby',data.get('id'));p=get(c,'pregnancy',baby['pregnancy_id'])
+   if p['subject_id']!=user:raise Problem(403,'没有宝宝状态记录权限')
   return json.loads(prior['result'])
  # Old requests do not contain enough context to prove that a retry is identical.
  if c.execute('SELECT 1 FROM requests WHERE user_id=? AND key=?',(user,key)).fetchone():raise Problem(409,'旧请求无法核对原始内容，请刷新后重试')
@@ -227,7 +238,7 @@ def erase_account(c,user):
    removed.add(t['id']);c.execute("DELETE FROM records WHERE kind='task' AND id=?",(t['id'],))
   else:
    t['pregnancy_id']=None;t['stage']=None;put(c,'task',t,row['family_id'])
- for kind in ('pregnancy','pregnancy_event','outbox','appointment','baby','chat','consent','wechat_identity','notification_preferences','ai_usage','transfer'):
+ for kind in ('pregnancy','pregnancy_event','baby_event','outbox','appointment','baby','chat','consent','wechat_identity','notification_preferences','ai_usage','transfer'):
   for obj in rows(c,kind):
    if obj.get('pregnancy_id') in owned or obj['id'] in owned or any(obj.get(k)==user for k in ('subject_id','owner','subject','grantee','user_id','from','to')):
     removed.add(obj['id']);c.execute('DELETE FROM records WHERE kind=? AND id=?',(kind,obj['id']))
@@ -247,18 +258,19 @@ def erase_account(c,user):
 def can_view_approval(c,fid,user,a):
  if a['resource'] not in ('task','item'):return True
  obj=require_active(c,fid,a['resource'],a['target'])
- return not obj.get('private_health_anchor') or can_health(c,fid,user,get(c,'pregnancy',obj['pregnancy_id']))
+ return can_view_task(c,fid,user,obj)
 
 def snapshot(c,user,fid):
  me=member(c,fid,user);f=get(c,'family',fid)
  expire_approvals(c,fid)
  members=[dict(r) for r in c.execute('SELECT u.id,u.name,m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.family_id=? AND m.active=1',(fid,))]
  tasks=rows(c,'task',fid);items=rows(c,'item',fid)
- tasks=[t for t in tasks if not t.get('private_health_anchor') or can_health(c,fid,user,get(c,'pregnancy',t['pregnancy_id']))]
+ tasks=[t for t in tasks if can_view_task(c,fid,user,t)]
  if me['role']=='member':tasks=[t for t in tasks if t['assignee']==user];items=[i for i in items if i['assignee']==user]
  p=get(c,'pregnancy',f['active_pregnancy_id']) if f.get('active_pregnancy_id') else None
  if p and not can_health(c,fid,user,p):p={'id':p['id'],'restricted':True}
  elif p:p['timeline']=dates.timeline(p,f.get('timezone',dates.DEFAULT_TIMEZONE))
+ babies=[b for b in rows(c,'baby',fid) if lifecycle.can_read_babies(c,fid,user,get(c,'pregnancy',b['pregnancy_id']))]
  approvals=rows(c,'approval',fid)
  approvals=[a for a in approvals if me['role'] in ('dad','mom') and (a['approver']==user or a['proposer']==user)]
  approvals=[a for a in approvals if can_view_approval(c,fid,user,a)]
@@ -268,7 +280,7 @@ def snapshot(c,user,fid):
   if can_health(c,fid,user,ap) or (not ap and a['owner']==user):appointments.append(a)
  knowledge=published_knowledge(c)
  orders=[o for o in rows(c,'order',fid) if o['payer']==user]
- return {'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'items':items,'pregnancy':p,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and (not n.get('pregnancy_id') or n.get('health_sensitive') is False or can_health(c,fid,user,get(c,'pregnancy',n['pregnancy_id'])))], 'reminder_preferences':next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==user),{'enabled':True}), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
+ return {'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'items':items,'pregnancy':p,'babies':babies,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and can_view_notification(c,fid,user,n)], 'reminder_preferences':next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==user),{'enabled':True}), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
 def propose(c,fid,user,resource,action,payload,target=None):
  mom=c.execute("SELECT user_id FROM memberships WHERE family_id=? AND role='mom' AND active=1",(fid,)).fetchone()
  if not mom:raise Problem(409,'需要妈妈加入家庭后才能启用确认')
@@ -282,6 +294,32 @@ def apply_policy(c,fid,value):
   if a['resource'] in ('task','item'):
    obj=require_active(c,fid,a['resource'],a['target'])
    if obj['status']=='pending':obj['status']='in_progress';put(c,a['resource'],obj,fid)
+
+def family_timezone(c,fid,value):
+ try:zone=dates.timezone_name(value)
+ except ValueError as e:raise Problem(400,str(e))
+ current=today(zone)
+ for p in rows(c,'pregnancy',fid):
+  if (p['state']=='pregnant' and p.get('edd') and date(p['edd'])>current+datetime.timedelta(days=280)) or (p['state']=='postpartum' and p.get('birth_date') and date(p['birth_date'])>current):raise Problem(409,'新时区与现有日期记录冲突，请由资料本人核对后再修改')
+ for b in rows(c,'baby',fid):
+  if b['status']!='entry_corrected' and (date(b['birth_date'])>current or (b.get('status_date') and date(b['status_date'])>current)):raise Problem(409,'新时区与现有日期记录冲突，请由资料本人核对后再修改')
+ return zone
+
+def apply_family_settings(c,fid,payload):
+ f=get(c,'family',fid)
+ zone=family_timezone(c,fid,payload.get('timezone',f.get('timezone',dates.DEFAULT_TIMEZONE)))
+ changed_zone=zone!=f.get('timezone',dates.DEFAULT_TIMEZONE)
+ changed_policy=payload.get('mode',f['mode'])!=f['mode']
+ f['name']=text(payload.get('name',f['name']),40);f['timezone']=zone;put(c,'family',f,fid)
+ if changed_zone or changed_policy:apply_policy(c,fid,payload.get('mode',f['mode']))
+ else:
+  for a in rows(c,'approval',fid):
+   if a['resource']=='family' and a['status']=='pending':a['status']='cancelled';put(c,'approval',a,fid)
+ if changed_zone:
+  for kind in ('task','appointment'):
+   for obj in rows(c,kind,fid):
+    if obj['status'] in ('todo','in_progress','scheduled') and (obj.get('due_date') or kind=='appointment'):
+     reset_reminder(c,fid,obj);put(c,kind,obj,fid)
 def complete(c,fid,kind,obj):
  obj['status']='done';obj['completed_at']=now();reset_reminder(c,fid,obj);return put(c,kind,obj,fid)
 
@@ -352,19 +390,22 @@ def preview_transition(c,user,fid,data):
    old=before.get(t['id'])
    if not old:change='created'
    elif old['status']!=t['status'] and t['status']=='cancelled':change='cancelled'
+   elif old['status']=='cancelled' and t['status']!='cancelled':change='restored'
    elif old.get('due_date')!=t.get('due_date'):change='rescheduled'
    else:continue
    changes.append({'id':t['id'],'title':t['title'],'change':change,'before_date':old.get('due_date') if old else None,'after_date':t.get('due_date')})
   cancelled=sum(not n.get('cancelled') and get(c,'notification',id).get('cancelled',False) for id,n in notices.items())
   after=get(c,'pregnancy',p['id'])
-  result={'preview_token':token,'state':after['state'],'effective_edd':after.get('edd'),'dating_source':after.get('dating_source'),'lmp':after.get('lmp'),'changes':changes,'counts':{kind:sum(t['change']==kind for t in changes) for kind in ('created','rescheduled','cancelled')},'cancelled_notifications':cancelled,'preserved_completed':sum(t.get('pregnancy_id')==p['id'] and t['status']=='done' for t in before.values()),'pinned_appointments':sum(a.get('pregnancy_id')==p['id'] and a['status']=='scheduled' for a in rows(c,'appointment',fid))}
+  babies=[{'name':b['name'],'status':b['status']} for b in rows(c,'baby',fid) if b['pregnancy_id']==p['id'] and b['status']!='entry_corrected' and lifecycle.can_read_babies(c,fid,user,p)] if data.get('event')=='birth' else []
+  result={'babies':babies,'preview_token':token,'state':after['state'],'paused':after.get('paused',False),'effective_edd':after.get('edd'),'dating_source':after.get('dating_source'),'lmp':after.get('lmp'),'changes':changes,'counts':{kind:sum(t['change']==kind for t in changes) for kind in ('created','rescheduled','cancelled','restored')},'cancelled_notifications':cancelled,'preserved_completed':sum(t.get('pregnancy_id')==p['id'] and t['status']=='done' for t in before.values()),'pinned_appointments':sum(a.get('pregnancy_id')==p['id'] and a['status']=='scheduled' for a in rows(c,'appointment',fid))}
  finally:
   c.execute('ROLLBACK TO SAVEPOINT pregnancy_preview');c.execute('RELEASE SAVEPOINT pregnancy_preview')
  return result
 
 def transition(c,fid,user,p,data):
  before_record=dict(p)
- event=data.get('event');d=data.get('date');before=p['state'];before_revision=p['revision'];allowed={'dating':{'set_edd','set_lmp','end','pause','resume','archive'},'pregnant':{'set_edd','set_lmp','birth','end','pause','resume','archive'},'postpartum':{'correct_birth','pause','resume','archive'},'ended':{'pause','resume','archive'}}
+ event_id=uid()
+ event=data.get('event');d=data.get('date');before=p['state'];before_revision=p['revision'];allowed={'dating':{'set_edd','set_lmp','end','pause','resume','archive'},'pregnant':{'set_edd','set_lmp','birth','end','pause','resume','archive'},'postpartum':{'correct_birth','correct_birth_record','pause','resume','archive'},'ended':{'pause','resume','archive'}}
  current=today(get(c,'family',fid).get('timezone',dates.DEFAULT_TIMEZONE))
  if event not in allowed.get(before,set()):raise Problem(409,'当前阶段不支持这项变更')
  reason=data.get('reason','')
@@ -388,11 +429,25 @@ def transition(c,fid,user,p,data):
   p['birth_date']=d;p['state']='postpartum'
   if event=='birth':
    count=data.get('babies',1)
-   if not isinstance(count,int) or count not in (1,2,3):raise Problem(400,'宝宝数量需为 1—3')
-   for i in range(count):put(c,'baby',{'id':uid(),'pregnancy_id':p['id'],'birth_date':d,'name':'宝宝'+(str(i+1) if count>1 else ''),'status':'growing'},fid)
+   if type(count) is not int or count not in (1,2,3):raise Problem(400,'宝宝数量需为 1—3')
+   outcomes=data.get('birth_outcomes')
+   if outcomes is not None:
+    if user!=p['subject_id']:raise Problem(403,'分娩结果由本孕次本人以监护人身份确认')
+    if data.get('guardian_consent') is not True:raise Problem(400,'分娩结果需要监护人单独确认')
+    if not isinstance(outcomes,list) or len(outcomes)!=count or any(x not in ('growing','hospitalized','lost') for x in outcomes):raise Problem(400,'请逐个确认宝宝状态，数量需与分娩记录一致')
+   p['birth_event_id']=event_id
+   for i in range(count):
+    baby={'id':uid(),'pregnancy_id':p['id'],'birth_date':d,'birth_date_follows_pregnancy':True,'name':'宝宝'+(str(i+1) if count>1 else ''),'status':outcomes[i] if outcomes is not None else 'unconfirmed'}
+    if outcomes is not None:baby['status_date']=d
+    saved=put(c,'baby',baby,fid)
+    if outcomes is not None:put(c,'baby_event',{'id':uid(),'event':'birth_confirmation','pregnancy_id':p['id'],'baby_id':baby['id'],'actor':user,'before':dict(baby,status='unconfirmed'),'after':saved,'reason':'','effective_date':d,'guardian_notice_version':'1.0','created_at':now()},fid)
+   lifecycle.restore_postpartum_tasks(c,fid,p)
   else:
    for b in rows(c,'baby',fid):
-    if b['pregnancy_id']==p['id']:b['birth_date']=d;put(c,'baby',b,fid)
+    if b['pregnancy_id']==p['id'] and b['status']!='entry_corrected' and b.get('birth_date_follows_pregnancy',True):
+     if b.get('status_date') and date(b['status_date'])<birth:raise Problem(409,'出生日期晚于已记录的宝宝状态日期，请先核对记录')
+     b['birth_date']=d;put(c,'baby',b,fid)
+ elif event=='correct_birth_record':lifecycle.correct_birth(c,fid,user,p,data,event_id)
  elif event=='end':
   if date(d)>current:raise Problem(400,'结束日期不能在未来')
   p['end_date']=d;p['state']='ended';p['paused']=True
@@ -401,14 +456,14 @@ def transition(c,fid,user,p,data):
  elif event=='archive':p['archived']=True;p['paused']=True
  p['revision']+=1;put(c,'pregnancy',p,fid);templates.sync(c,fid,p)
  audit(c,fid,user,'health.transition',{'pregnancy_id':p['id'],'event':event,'before':before,'after':p['state'],'before_revision':before_revision,'revision':p['revision'],'effective_date':d if event in ('set_edd','set_lmp','birth','correct_birth','end') else str(current),'dating_source':p.get('dating_source'),'reason':reason.strip()})
- if event in ('birth','end','archive','pause'):
+ if event in ('birth','end','archive','pause','correct_birth_record'):
   for n in rows(c,'notification',fid):
    if n.get('pregnancy_id')==p['id'] and not n['read']:n['cancelled']=True;put(c,'notification',n,fid)
  if event in ('birth','end'):
   for t in rows(c,'task',fid):
    if t.get('pregnancy_id')==p['id'] and t.get('stage')=='pregnant' and t['status'] not in ('done','skipped','cancelled'):
-    invalidate_approvals(c,fid,'task',t['id']);t['status']='cancelled';put(c,'task',t,fid)
- event_id=uid();after=get(c,'pregnancy',p['id'])
+    invalidate_approvals(c,fid,'task',t['id']);t['status_before_lifecycle']=t['status'];t['status']='cancelled';t['lifecycle_cancelled_by']=event_id;put(c,'task',t,fid)
+ after=get(c,'pregnancy',p['id'])
  put(c,'pregnancy_event',{'id':event_id,'pregnancy_id':p['id'],'actor':user,'event':event,'before':before_record,'after':after,'revision':p['revision'],'effective_date':d if event in ('set_edd','set_lmp','birth','correct_birth','end') else str(current),'reason':reason.strip(),'created_at':now()},fid)
  if event in ('set_edd','set_lmp','birth','correct_birth'):
   recipients=[r['user_id'] for r in c.execute('SELECT user_id FROM memberships WHERE family_id=? AND active=1',(fid,)) if can_health(c,fid,r['user_id'],after)]
@@ -432,11 +487,11 @@ def mutate(c,user,fid,action,data):
   if role!='dad':raise Problem(403,'只有统筹者可以修改协作设置')
   version(f,data);mode=data.get('mode',f['mode'])
   if mode not in ('off','selected','all'):raise Problem(400,'确认模式不正确')
-  if mode!=f['mode'] and f['mode']!='off':return propose(c,fid,user,'family','policy',{'mode':mode,'version':f['version']},fid)
+  zone=family_timezone(c,fid,data.get('timezone',f.get('timezone',dates.DEFAULT_TIMEZONE)))
+  payload={'name':text(data.get('name',f['name']),40),'mode':mode,'timezone':zone,'version':f['version']}
+  if (mode!=f['mode'] or zone!=f.get('timezone',dates.DEFAULT_TIMEZONE)) and f['mode']!='off':return propose(c,fid,user,'family','policy',payload,fid)
   if mode!='off' and not c.execute("SELECT 1 FROM memberships WHERE family_id=? AND role='mom' AND active=1",(fid,)).fetchone():raise Problem(409,'妈妈加入后才可启用确认')
-  f['name']=text(data.get('name',f['name']),40)
-  changed=mode!=f['mode'];put(c,'family',f,fid)
-  if changed:apply_policy(c,fid,mode)
+  apply_family_settings(c,fid,payload)
   audit(c,fid,user,action,{})
  elif action=='invite.create':
   if role!='dad':raise Problem(403,'只有统筹者可以邀请家人')
@@ -496,7 +551,7 @@ def mutate(c,user,fid,action,data):
   audit(c,fid,user,action,{'id':obj['id']});return {'id':obj['id']}
  elif action in ('task.update','item.update','appointment.update'):
   kind=action.split('.')[0];obj=require_active(c,fid,kind,data.get('id'));version(obj,data);original=dict(obj)
-  if obj.get('private_health_anchor') and not can_health(c,fid,user,get(c,'pregnancy',obj['pregnancy_id'])):raise Problem(403,'此事项包含健康日期，需要本人授权查看')
+  if kind=='task' and not can_view_task(c,fid,user,obj):raise Problem(403,'此事项需要相应资料的查看授权')
   if kind=='appointment':
    if obj['owner']!=user:raise Problem(403,'只有录入人可修改预约')
    if obj.get('pregnancy_id') and not can_edit_health(c,fid,user,get(c,'pregnancy',obj['pregnancy_id'])):raise Problem(403,'健康资料代录授权已失效')
@@ -508,6 +563,7 @@ def mutate(c,user,fid,action,data):
    if obj['date']!=original['date'] or obj['status']!=original['status']:reset_reminder(c,fid,obj)
   else:
    desired=data.get('status',obj['status'])
+   if 'status' in data:obj.pop('lifecycle_cancelled_by',None);obj.pop('status_before_lifecycle',None)
    if desired not in ('todo','in_progress','done','skipped','cancelled') and not (desired=='pending' and 'status' not in data):raise Problem(400,'状态不正确')
    if 'assignee' in data or 'due_date' in data or 'title' in data or 'name' in data or 'note' in data:
     if role!='dad':raise Problem(403,'只有统筹者可以编辑分工与内容')
@@ -539,11 +595,11 @@ def mutate(c,user,fid,action,data):
   if decision not in ('approved','rejected'):raise Problem(400,'确认结果不正确')
   if a['resource']=='family':
    if f['version']!=a['payload']['version']:raise Problem(409,'家庭设置已变更，请重新发起')
-   if decision=='approved':apply_policy(c,fid,a['payload']['mode'])
+   if decision=='approved':apply_family_settings(c,fid,a['payload'])
   else:
    obj=require_active(c,fid,a['resource'],a['target'])
    if obj['version']!=a['payload']['version'] or obj['status']!='pending':raise Problem(409,'事项内容已变更，请重新提交')
-   if obj.get('private_health_anchor') and not can_health(c,fid,user,get(c,'pregnancy',obj['pregnancy_id'])):raise Problem(403,'此事项包含健康日期，需要本人授权查看')
+   if not can_view_task(c,fid,user,obj):raise Problem(403,'此事项需要相应资料的查看授权')
    if decision=='approved':complete(c,fid,a['resource'],obj)
    else:obj['status']='in_progress';put(c,a['resource'],obj,fid)
   a['status']=decision;a['decided_at']=now();a['reason']=str(data.get('reason',''))[:300];put(c,'approval',a,fid);notify(c,fid,a['proposer'],'你的家庭确认申请已有结果');audit(c,fid,user,action,{'id':a['id'],'decision':decision})
@@ -558,10 +614,14 @@ def mutate(c,user,fid,action,data):
   p=pregnancy_for_event(c,user,fid,data)
   if 'preview_token' in data and data['preview_token']!=transition_fingerprint(c,user,fid,data):raise Problem(409,'预览后家庭安排已变化，请重新预览再提交')
   return transition(c,fid,user,p,data)
+ elif action=='baby.update':
+  if 'preview_token' in data and data['preview_token']!=transition_fingerprint(c,user,fid,data):raise Problem(409,'预览后家庭安排已变化，请重新预览')
+  return lifecycle.record_baby(c,fid,user,data)
  elif action=='consent.update':
   if role!='mom':raise Problem(403,'健康资料仅由本人授权')
   grantee=data.get('grantee');scope=data.get('scope')
-  if scope not in ('health_read','health_edit','ai_context'):raise Problem(400,'授权用途无效')
+  if scope not in ('health_read','health_edit','ai_context','baby_read'):raise Problem(400,'授权用途无效')
+  if scope=='baby_read' and data.get('enabled') is True and data.get('guardian_consent') is not True:raise Problem(400,'共享宝宝资料需监护人单独确认')
   member(c,fid,grantee)
   if scope=='health_edit' and grantee!=f['coordinator']:raise Problem(400,'代录仅授予家庭统筹者')
   for g in rows(c,'consent',fid):
@@ -648,7 +708,7 @@ def tick():
    if task.get('pregnancy_id'):
     p=get(c,'pregnancy',task['pregnancy_id'])
     if p['paused'] or p['archived'] or p['state']=='ended':continue
-    if task.get('private_health_anchor') and not can_health(c,fid,task['assignee'],p):continue
+    if not can_view_task(c,fid,task['assignee'],task):continue
    prefs=next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==task['assignee']),None)
    if prefs and not prefs['enabled']:continue
    id='task-'+task['id']+'-'+str(task.get('due_date'))+('-r'+str(task['reminder_revision']) if task.get('reminder_revision') else '')

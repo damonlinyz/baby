@@ -89,3 +89,32 @@ class HttpTests(unittest.TestCase):
   self.assertEqual(self.req('/api/me',token=mt)[0],401)
   status,s=self.req('/api/state?family_id='+fid,token=dt)
   self.assertEqual(status,200);self.assertIsNone(s['pregnancy']);self.assertEqual(len(s['members']),1)
+
+ def test_child_preview_sharing_export_and_timezone(self):
+  dad=self.account('http-child-dad');mom=self.account('http-child-mom')
+  dt,dc=dad['session_token'],dad['csrf'];mt,mc=mom['session_token'],mom['csrf']
+  _,f=self.req('/api/families',{'name':'多胎测试'},dt,dc);fid=f['family_id'];seq=0
+  def act(token,csrf,action,data):
+   nonlocal seq
+   seq+=1
+   status,r=self.req('/api/action',{'family_id':fid,'action':action,'data':data,'request_id':'baby-http-'+str(seq)},token,csrf)
+   self.assertEqual(status,200,r);return r
+  def state(token):return self.req('/api/state?family_id='+fid,token=token)[1]
+  invite=act(dt,dc,'invite.create',{'role':'mom'});self.assertEqual(self.req('/api/join',{'code':invite['invite_code']},mt,mc)[0],200)
+  act(mt,mc,'pregnancy.create',{'consent':True});p=state(mt)['pregnancy'];today=p['timeline']['as_of']
+  act(mt,mc,'pregnancy.event',{'id':p['id'],'version':p['version'],'event':'set_edd','date':str(datetime.date.fromisoformat(today)+datetime.timedelta(days=100))})
+  p=state(mt)['pregnancy'];act(mt,mc,'pregnancy.event',{'id':p['id'],'version':p['version'],'event':'birth','date':today,'babies':2})
+  act(mt,mc,'consent.update',{'scope':'health_read','grantee':dad['user']['id'],'enabled':True})
+  self.assertEqual(state(dt)['babies'],[])
+  baby=state(mt)['babies'][0];data={'id':baby['id'],'version':baby['version'],'status':'lost','date':today,'guardian_consent':True,'reason':'child-private-note'}
+  status,preview=self.req('/api/babies/preview',{'family_id':fid,'data':data},mt,mc);self.assertEqual(status,200)
+  self.assertEqual(state(mt)['babies'][0]['status'],'unconfirmed')
+  act(mt,mc,'baby.update',dict(data,preview_token=preview['preview_token']))
+  self.assertEqual(state(mt)['pregnancy']['state'],'postpartum')
+  act(mt,mc,'consent.update',{'scope':'baby_read','grantee':dad['user']['id'],'enabled':True,'guardian_consent':True})
+  _,export=self.req('/api/export?family_id='+fid,token=dt);self.assertEqual(len(export['babies']),2);self.assertEqual(len(export['baby_events']),1)
+  act(mt,mc,'consent.update',{'scope':'baby_read','grantee':dad['user']['id'],'enabled':False})
+  _,export=self.req('/api/export?family_id='+fid,token=dt);self.assertEqual(export['babies'],[]);self.assertEqual(export['baby_events'],[]);self.assertNotIn('child-private-note',json.dumps(export))
+  p=state(mt)['pregnancy'];status,_=self.req('/api/pregnancy/preview',{'family_id':fid,'data':{'id':p['id'],'version':p['version'],'event':'correct_birth_record','birth_event_id':p['birth_event_id'],'confirm_correction':True,'reason':'合成误录'}},mt,mc);self.assertEqual(status,409)
+  f=state(dt)['family'];act(dt,dc,'family.update',{'version':f['version'],'timezone':'Asia/Tokyo'})
+  self.assertEqual(state(mt)['pregnancy']['timeline']['timezone'],'Asia/Tokyo')

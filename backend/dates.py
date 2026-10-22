@@ -2,10 +2,19 @@
 import calendar
 import datetime as dt
 import re
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_TIMEZONE = 'Asia/Shanghai'
 SOURCES = ('lmp_estimate', 'clinician_entered', 'user_entered')
+
+
+def timezone_name(value):
+    if not isinstance(value, str) or not value.strip() or len(value) > 80:
+        raise ValueError('请填写有效的 IANA 时区名称')
+    try:
+        return ZoneInfo(value.strip()).key
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValueError('时区名称不正确，例如 Asia/Shanghai')
 
 
 def parse(value):
@@ -63,8 +72,8 @@ def timeline(p, timezone=DEFAULT_TIMEZONE, on_date=None):
         baby_age = age(parse(p['birth_date']), current)
         days = baby_age['days']
         result.update(postpartum_days=days, baby_age=baby_age, phase='postpartum_early' if days <= 42 else 'postpartum_later',
-                      title=f'宝宝出生 {days} 天', progress=100,
-                      description='一起照顾妈妈，也慢慢适应新的生活。' if days <= 42 else '妈妈的恢复与宝宝的成长，同样值得被看见。')
+                      title=f'产后第 {days} 天', progress=100,
+                      description='优先照顾妈妈的休息与恢复。' if days <= 42 else '按实际精力安排日常支持，妈妈的恢复始终重要。')
     elif p['state'] == 'ended':
         result.update(phase='ended', title='给彼此，一点时间', description='相关促活已停止。你可以安静地保存、归档这些记录。')
     return result

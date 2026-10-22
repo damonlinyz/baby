@@ -4,7 +4,7 @@ import os,sys,json,time,hashlib,secrets,threading,urllib.parse,urllib.request,sq
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 from pathlib import Path
 import domain as d
-import payments
+import payments,lifecycle
 ROOT=Path(__file__).resolve().parent.parent
 PORT=int(os.environ.get('PORT','8766'));HOST=os.environ.get('HOST','127.0.0.1')
 PUBLIC_ORIGIN=os.environ.get('PUBLIC_ORIGIN',f'http://127.0.0.1:{PORT}')
@@ -138,6 +138,7 @@ class Handler(BaseHTTPRequestHandler):
     elif path=='/api/export':
      fid=q.get('family_id',[''])[0];result=d.snapshot(c,user,fid);result.pop('consents',None)
      result['pregnancy_events']=[e for e in d.rows(c,'pregnancy_event',fid) if d.can_health(c,fid,user,d.get(c,'pregnancy',e['pregnancy_id']))]
+     result['baby_events']=[e for e in d.rows(c,'baby_event',fid) if lifecycle.can_read_babies(c,fid,user,d.get(c,'pregnancy',e['pregnancy_id']))]
      d.audit(c,fid,user,'data.export',{})
     elif path=='/api/audit':
      fid=q.get('family_id',[''])[0];d.member(c,fid,user,('dad',));result={'events':[dict(r) for r in c.execute("SELECT id,actor,type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 100",(fid,))]}
@@ -202,6 +203,9 @@ class Handler(BaseHTTPRequestHandler):
    if path=='/api/admin/refund/query':self.respond(payments.query_refund(user,data.get('refund_id')));return
    if path=='/api/ai':
     result=ask_ai(user,d.text(data.get('family_id'),64),data.get('question'),d.text(data.get('request_id'),80));self.respond(result);return
+   if path=='/api/babies/preview':
+    with d.transaction() as c:result=lifecycle.preview_baby(c,d.text(data.get('family_id'),64),user,data.get('data',{}))
+    self.respond(result);return
    if path=='/api/pregnancy/preview':
     with d.transaction() as c:result=d.preview_transition(c,user,d.text(data.get('family_id'),64),data.get('data',{}))
     self.respond(result);return
