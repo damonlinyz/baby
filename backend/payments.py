@@ -63,12 +63,25 @@ def settle(c,provider,tx,body_hash):
   c.execute('INSERT OR IGNORE INTO payment_transactions VALUES(?,?,?)',(provider,tx['transaction_id'],o['id']))
   if o.get('transaction_id') and o['transaction_id']!=tx['transaction_id']:raise d.Problem(409,'订单交易号不一致')
   if o['status'] not in ('paid','refunded','refund_pending'):
-   o.update(status='paid',paid_at=d.now(),transaction_id=tx['transaction_id']);d.put(c,'order',o,fid)
-   grant={'id':'grant-'+o['id'],'source_order':o['id'],'owner':o['payer'],'bound_family':fid,'benefit':'core' if o['sku']=='core' else 'ai','status':'active','starts_at':d.now(),'ends_at':None,'quota':300,'policy_version':o['policy_version']}
-   if o['sku']=='ai30':
-    previous=max([e.get('ends_at') or 0 for e in d.rows(c,'entitlement',fid) if e['benefit']=='ai' and e['status']=='active']+[d.now()]);grant['starts_at']=previous;grant['ends_at']=previous+2592000
-   d.put(c,'entitlement',grant,fid)
-   if o['sku']=='core':d.put(c,'entitlement',{'id':'gift-'+o['id'],'source_order':o['id'],'owner':o['payer'],'bound_family':fid,'benefit':'ai_gift','status':'unactivated','starts_at':None,'ends_at':None,'quota':300,'policy_version':o['policy_version']},fid)
+   o.update(status='paid',paid_at=d.now(),transaction_id=tx['transaction_id'])
+   core=next((e for e in sorted(d.rows(c,'entitlement',fid),key=lambda e:(e.get('starts_at') or 0,e['id'])) if e.get('benefit')=='core' and e.get('status')=='active' and e.get('source_order')!=o['id']),None) if o['sku']=='core' else None
+   if core:
+    # The transaction is real, but this family already owns the one-time product.
+    # Keep its funds visible and queue review; never contact a refund provider here.
+    refund_id='Rdup'+hashlib.sha256(o['id'].encode()).hexdigest()[:28]
+    o.update(fulfillment_status='duplicate_core',duplicate_of_order_id=core['source_order'],refund_id=refund_id)
+    d.put(c,'order',o,fid)
+    refund={'id':refund_id,'order_id':o['id'],'requested_by':o['payer'],'amount_fen':o['amount_fen'],'reason':'重复买断收款：家庭已拥有核心产品，请核验后原路退款','source':'system_duplicate_core','status':'requested','created_at':d.now()}
+    d.put(c,'refund',refund,fid)
+    d.audit(c,fid,None,'payment.duplicate_core',{'order_id':o['id'],'original_order_id':core['source_order'],'refund_id':refund_id})
+    d.notify(c,fid,o['payer'],'检测到重复买断收款，已创建售后处理单；尚未退款',o['id'])
+   else:
+    o['fulfillment_status']='granted';d.put(c,'order',o,fid)
+    grant={'id':'grant-'+o['id'],'source_order':o['id'],'owner':o['payer'],'bound_family':fid,'benefit':'core' if o['sku']=='core' else 'ai','status':'active','starts_at':d.now(),'ends_at':None,'quota':300,'policy_version':o['policy_version']}
+    if o['sku']=='ai30':
+     previous=max([e.get('ends_at') or 0 for e in d.rows(c,'entitlement',fid) if e['benefit']=='ai' and e['status']=='active']+[d.now()]);grant['starts_at']=previous;grant['ends_at']=previous+2592000
+    d.put(c,'entitlement',grant,fid)
+    if o['sku']=='core':d.put(c,'entitlement',{'id':'gift-'+o['id'],'source_order':o['id'],'owner':o['payer'],'bound_family':fid,'benefit':'ai_gift','status':'unactivated','starts_at':None,'ends_at':None,'quota':300,'policy_version':o['policy_version']},fid)
    d.audit(c,fid,o['payer'],'payment.paid',{'order_id':o['id']})
  c.execute('INSERT INTO payment_events VALUES(?,?,?,?)',(provider,tx['event_id'],body_hash,d.now()))
 def callback(provider,headers,raw):
@@ -100,7 +113,9 @@ def request_refund(user,order_id,reason):
   if o['payer']!=user:raise d.Problem(403,'只能为本人的订单申请售后')
   if o['status']!='paid':raise d.Problem(409,'仅已支付订单可申请退款')
   for r in d.rows(c,'refund',o['family_id']):
-   if r['order_id']==order_id and r['status'] not in ('rejected','failed'):raise d.Problem(409,'已经有退款正在处理中')
+   if r['order_id']==order_id and r['status'] not in ('rejected','failed'):
+    if r.get('source')=='system_duplicate_core':return r
+    raise d.Problem(409,'已经有退款正在处理中')
   refund={'id':'R'+secrets.token_hex(14),'order_id':order_id,'requested_by':user,'amount_fen':o['amount_fen'],'reason':d.text(reason,500),'status':'requested','created_at':d.now()};d.put(c,'refund',refund,o['family_id']);d.audit(c,o['family_id'],user,'refund.requested',{'refund_id':refund['id']});return refund
 
 def approve_refund(operator,refund_id):
