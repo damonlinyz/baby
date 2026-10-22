@@ -41,6 +41,8 @@ def init():
   CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
   ''')
   c.execute("INSERT OR IGNORE INTO metadata VALUES('schema_version','1')")
+  c.execute("INSERT OR IGNORE INTO metadata VALUES('instance_id',?)",(uid(),))
+  attach_deletion_ledger(c)
  try:os.chmod(DB,0o600)
  except OSError:pass
 
@@ -185,6 +187,27 @@ def delete_account(c,user,password):
  r=c.execute('SELECT password FROM users WHERE id=?',(user,)).fetchone()
  if not r or not password_ok(password,r['password']):raise Problem(403,'请重新输入账号密码以确认')
  if c.execute("SELECT 1 FROM memberships WHERE user_id=? AND role='dad' AND active=1",(user,)).fetchone():raise Problem(409,'请先转交家庭统筹权限，再删除账号')
+ attach_deletion_ledger(c)
+ c.execute('INSERT OR IGNORE INTO deletion_log.tombstones VALUES(?,?)',(user,now()))
+ return erase_account(c,user)
+
+def deletion_ledger_path(db=None):return Path(str(db or DB)+'.deletions.sqlite3')
+
+def attach_deletion_ledger(c):
+ if not any(r[1]=='deletion_log' for r in c.execute('PRAGMA database_list')):
+  c.execute('ATTACH DATABASE ? AS deletion_log',(str(deletion_ledger_path()),))
+ # Attached-database atomic commit requires rollback journals on both files.
+ if c.execute('PRAGMA main.journal_mode').fetchone()[0]!='delete' or c.execute('PRAGMA deletion_log.journal_mode').fetchone()[0]!='delete':raise Problem(503,'删除记录需要 SQLite DELETE 日志模式，请先检查数据库配置')
+ os.chmod(deletion_ledger_path(),0o600)
+ c.execute('CREATE TABLE IF NOT EXISTS deletion_log.metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+ c.execute('CREATE TABLE IF NOT EXISTS deletion_log.tombstones(user_id TEXT PRIMARY KEY,deleted_at INTEGER NOT NULL)')
+ instance=c.execute("SELECT value FROM main.metadata WHERE key='instance_id'").fetchone()[0]
+ bound=c.execute("SELECT value FROM deletion_log.metadata WHERE key='instance_id'").fetchone()
+ if bound and bound[0]!=instance:raise Problem(503,'删除记录与业务数据库不匹配')
+ c.execute("INSERT OR IGNORE INTO deletion_log.metadata VALUES('instance_id',?)",(instance,))
+
+def erase_account(c,user):
+ # Used by authenticated deletion and by offline recovery's tombstone replay.
  owned={p['id'] for p in rows(c,'pregnancy') if p.get('subject_id')==user}
  affected={r['family_id'] for r in c.execute('SELECT family_id FROM memberships WHERE user_id=?',(user,))}
  for fid in affected:
