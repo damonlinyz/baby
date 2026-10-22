@@ -234,6 +234,8 @@ def erase_account(c,user):
    removed.add(a['id']);c.execute("DELETE FROM records WHERE kind='approval' AND id=?",(a['id'],))
  for n in rows(c,'notification'):
   if n['recipient']==user or n.get('pregnancy_id') in owned or n.get('ref') in removed:c.execute("DELETE FROM records WHERE kind='notification' AND id=?",(n['id'],))
+ for event in c.execute("SELECT id,actor,body FROM events WHERE type LIKE 'health.%'").fetchall():
+  if event['actor']==user or json.loads(event['body']).get('pregnancy_id') in owned:c.execute('DELETE FROM events WHERE id=?',(event['id'],))
  # Erase results but retain deduplication keys, so a retry cannot recreate deleted data.
  for fid in affected:c.execute("UPDATE command_requests SET result='{}',invalidated=1 WHERE family_id=?",(fid,))
  c.execute('DELETE FROM requests WHERE user_id=?',(user,))
@@ -325,20 +327,28 @@ def preview_transition(c,user,fid,data):
    changes.append({'id':t['id'],'title':t['title'],'change':change,'before_date':old.get('due_date') if old else None,'after_date':t.get('due_date')})
   cancelled=sum(not n.get('cancelled') and get(c,'notification',id).get('cancelled',False) for id,n in notices.items())
   after=get(c,'pregnancy',p['id'])
-  result={'preview_token':token,'state':after['state'],'changes':changes,'counts':{kind:sum(t['change']==kind for t in changes) for kind in ('created','rescheduled','cancelled')},'cancelled_notifications':cancelled,'preserved_completed':sum(t.get('pregnancy_id')==p['id'] and t['status']=='done' for t in before.values()),'pinned_appointments':sum(a.get('pregnancy_id')==p['id'] and a['status']=='scheduled' for a in rows(c,'appointment',fid))}
+  result={'preview_token':token,'state':after['state'],'effective_edd':after.get('edd'),'dating_source':after.get('dating_source'),'lmp':after.get('lmp'),'changes':changes,'counts':{kind:sum(t['change']==kind for t in changes) for kind in ('created','rescheduled','cancelled')},'cancelled_notifications':cancelled,'preserved_completed':sum(t.get('pregnancy_id')==p['id'] and t['status']=='done' for t in before.values()),'pinned_appointments':sum(a.get('pregnancy_id')==p['id'] and a['status']=='scheduled' for a in rows(c,'appointment',fid))}
  finally:
   c.execute('ROLLBACK TO SAVEPOINT pregnancy_preview');c.execute('RELEASE SAVEPOINT pregnancy_preview')
  return result
 
 def transition(c,fid,user,p,data):
- event=data.get('event');d=data.get('date');before=p['state'];allowed={'dating':{'set_edd','end','pause','resume','archive'},'pregnant':{'set_edd','birth','end','pause','resume','archive'},'postpartum':{'correct_birth','pause','resume','archive'},'ended':{'pause','resume','archive'}}
+ event=data.get('event');d=data.get('date');before=p['state'];before_revision=p['revision'];allowed={'dating':{'set_edd','set_lmp','end','pause','resume','archive'},'pregnant':{'set_edd','set_lmp','birth','end','pause','resume','archive'},'postpartum':{'correct_birth','pause','resume','archive'},'ended':{'pause','resume','archive'}}
  current=today(get(c,'family',fid).get('timezone',dates.DEFAULT_TIMEZONE))
  if event not in allowed.get(before,set()):raise Problem(409,'当前阶段不支持这项变更')
- if event=='set_edd':
+ reason=data.get('reason','')
+ if not isinstance(reason,str) or len(reason)>300:raise Problem(400,'修订说明最多 300 字')
+ if event in ('set_edd','set_lmp'):
+  if event=='set_lmp':
+   lmp=date(d)
+   if lmp>current:raise Problem(400,'末次月经日期不能在未来')
+   if p.get('edd') and p.get('dating_source')=='clinician_entered':raise Problem(409,'已使用医生确认日期，不能用末次月经估算覆盖；如需修订请录入医生确认的预产期')
+   p['lmp']=d;d=str(dates.estimate_edd(d))
   edd=date(d)
   if edd<current-datetime.timedelta(days=35) or edd>current+datetime.timedelta(days=280):raise Problem(400,'预产期超出可录入范围，请核对')
-  source=data.get('source','user_entered')
+  source='lmp_estimate' if event=='set_lmp' else data.get('source','user_entered')
   if source not in dates.SOURCES:raise Problem(400,'日期来源不正确')
+  if source=='lmp_estimate' and p.get('dating_source')=='clinician_entered':raise Problem(409,'不能用末次月经估算覆盖医生确认日期')
   p['edd']=d;p['dating_source']=source;p['state']='pregnant';p['dating_revision']=p.get('dating_revision',0)+1
  elif event in ('birth','correct_birth'):
   birth=date(d)
@@ -359,7 +369,7 @@ def transition(c,fid,user,p,data):
  elif event=='resume':p['paused']=False
  elif event=='archive':p['archived']=True;p['paused']=True
  p['revision']+=1;put(c,'pregnancy',p,fid);templates.sync(c,fid,p)
- audit(c,fid,user,'health.transition',{'pregnancy_id':p['id'],'event':event,'before':before,'after':p['state']})
+ audit(c,fid,user,'health.transition',{'pregnancy_id':p['id'],'event':event,'before':before,'after':p['state'],'before_revision':before_revision,'revision':p['revision'],'effective_date':d if event in ('set_edd','set_lmp','birth','correct_birth','end') else str(current),'dating_source':p.get('dating_source'),'reason':reason.strip()})
  if event in ('birth','end','archive','pause'):
   for n in rows(c,'notification',fid):
    if n.get('pregnancy_id')==p['id'] and not n['read']:n['cancelled']=True;put(c,'notification',n,fid)

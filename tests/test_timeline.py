@@ -72,3 +72,36 @@ class TimelineTests(unittest.TestCase):
   for date,source in ((p['edd'],'invented'),(p['edd'].replace('-',''),'user_entered')):
    with self.assertRaises(d.Problem) as err:self.call(self.mom,'pregnancy.event',{'id':p['id'],'version':p['version'],'event':'set_edd','date':date,'source':source})
    self.assertEqual(err.exception.status,400)
+
+ def test_lmp_preview_records_original_date_and_estimated_edd(self):
+  self.call(self.mom,'pregnancy.create',{'consent':True});p=self.snap(self.mom)['pregnancy']
+  data={'id':p['id'],'version':p['version'],'event':'set_lmp','date':str(d.today()),'reason':'本人首次录入'}
+  preview=self.preview(data)
+  self.assertEqual(preview['effective_edd'],str(d.today()+datetime.timedelta(days=280)))
+  self.assertEqual(preview['dating_source'],'lmp_estimate')
+  self.assertIsNone(self.snap(self.mom)['pregnancy']['edd'])
+  self.call(self.mom,'pregnancy.event',dict(data,preview_token=preview['preview_token']))
+  result=self.snap(self.mom)['pregnancy']
+  self.assertEqual(result['lmp'],data['date']);self.assertEqual(result['timeline']['gestational_days'],0)
+  with d.transaction() as c:
+   event=c.execute("SELECT body FROM events WHERE type='health.transition'").fetchone()
+   body=d.json.loads(event['body']);self.assertEqual(body['reason'],data['reason'])
+   self.assertEqual(body['effective_date'],preview['effective_edd']);self.assertEqual(body['revision'],2)
+
+ def test_lmp_cannot_replace_clinician_date_even_via_legacy_source(self):
+  p=self.pregnancy()
+  self.call(self.mom,'pregnancy.event',{'id':p['id'],'version':p['version'],'event':'set_edd','date':p['edd'],'source':'clinician_entered'})
+  p=self.snap(self.mom)['pregnancy']
+  for event,date in (('set_lmp',str(d.today()-datetime.timedelta(days=100))),('set_edd',p['edd'])):
+   with self.assertRaises(d.Problem) as err:self.call(self.mom,'pregnancy.event',{'id':p['id'],'version':p['version'],'event':event,'date':date,'source':'lmp_estimate'})
+   self.assertEqual(err.exception.status,409)
+  self.assertEqual(self.snap(self.mom)['pregnancy']['dating_source'],'clinician_entered')
+
+ def test_invalid_lmp_is_rejected_and_deletion_removes_dated_audit(self):
+  p=self.pregnancy()
+  for value in (str(d.today()+datetime.timedelta(days=1)),str(d.today()-datetime.timedelta(days=400))):
+   with self.assertRaises(d.Problem) as err:self.call(self.mom,'pregnancy.event',{'id':p['id'],'version':p['version'],'event':'set_lmp','date':value})
+   self.assertEqual(err.exception.status,400)
+  with d.transaction() as c:
+   d.delete_account(c,self.mom,'long-password-123')
+   self.assertEqual(c.execute("SELECT count(*) FROM events WHERE type LIKE 'health.%'").fetchone()[0],0)

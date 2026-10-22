@@ -47,3 +47,5 @@ class CalendarTests(unittest.TestCase):
  def test_unknown_and_ended_dates_are_not_inferred(self):
   self.assertEqual(dates.timeline({'state':'dating'})['phase'],'dating')
   self.assertEqual(dates.timeline({'state':'ended','edd':'2026-10-22'})['phase'],'ended')
+ def test_lmp_estimate_crosses_leap_day_by_calendar_days(self):
+  self.assertEqual(str(dates.estimate_edd('2023-05-25')),'2024-02-29')

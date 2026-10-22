@@ -27,6 +27,10 @@ def anniversary(birth, years=1):
     return birth.replace(year=year, day=min(birth.day, calendar.monthrange(year, birth.month)[1]))
 
 
+def estimate_edd(lmp):
+    return parse(lmp) + dt.timedelta(days=280)
+
+
 def age(birth, on_date):
     if birth > on_date:
         raise ValueError('出生日期不能在未来')
