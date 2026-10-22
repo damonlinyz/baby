@@ -66,4 +66,48 @@ class DomainTests(unittest.TestCase):
   t=self.snap(self.dad)['tasks'][0];self.call(self.dad,'task.update',{'id':t['id'],'version':t['version'],'status':'done'})
   t=self.snap(self.dad)['tasks'][0];self.call(self.dad,'task.update',{'id':t['id'],'version':t['version'],'title':'更新后的任务'})
   self.assertFalse(any(a['status']=='pending' for a in self.snap(self.mom)['approvals']))
+ def pending_task(self):
+  f=self.snap(self.dad)['family'];self.call(self.dad,'family.update',{'version':f['version'],'mode':'all'})
+  t=self.snap(self.dad)['tasks'][0]
+  r=self.call(self.dad,'task.update',{'id':t['id'],'version':t['version'],'status':'done'})
+  return t,next(a for a in self.snap(self.mom)['approvals'] if a['id']==r['approval_id'])
+ def test_expired_confirmation_can_be_resubmitted(self):
+  t,a=self.pending_task()
+  with d.transaction() as c:
+   a['expires_at']=d.now();d.put(c,'approval',a,self.fid)
+  s=self.snap(self.dad);t=next(x for x in s['tasks'] if x['id']==t['id'])
+  self.assertEqual(t['status'],'in_progress')
+  self.assertEqual(next(x for x in s['approvals'] if x['id']==a['id'])['status'],'expired')
+  r=self.call(self.dad,'task.update',{'id':t['id'],'version':t['version'],'status':'done'})
+  a=next(x for x in self.snap(self.mom)['approvals'] if x['id']==r['approval_id'])
+  self.call(self.mom,'approval.decide',{'id':a['id'],'version':a['version'],'decision':'approved'})
+  self.assertEqual(next(x for x in self.snap(self.dad)['tasks'] if x['id']==t['id'])['status'],'done')
+ def test_policy_change_cancels_pending_completions(self):
+  t,a=self.pending_task();f=self.snap(self.dad)['family']
+  r=self.call(self.dad,'family.update',{'version':f['version'],'mode':'off'})
+  policy=next(x for x in self.snap(self.mom)['approvals'] if x['id']==r['approval_id'])
+  self.call(self.mom,'approval.decide',{'id':policy['id'],'version':policy['version'],'decision':'approved'})
+  s=self.snap(self.dad)
+  self.assertEqual(s['family']['mode'],'off')
+  self.assertEqual(next(x for x in s['tasks'] if x['id']==t['id'])['status'],'in_progress')
+  with self.assertRaises(d.Problem):self.call(self.mom,'approval.decide',{'id':a['id'],'version':a['version'],'decision':'approved'})
+ def test_template_redating_invalidates_only_changed_dates(self):
+  self.call(self.mom,'pregnancy.create',{'consent':True})
+  self.call(self.mom,'consent.update',{'scope':'health_read','grantee':self.dad,'enabled':True})
+  p=self.snap(self.mom)['pregnancy'];edd=str(d.today()+datetime.timedelta(days=100))
+  self.call(self.mom,'pregnancy.event',{'id':p['id'],'version':p['version'],'event':'set_edd','date':edd})
+  f=self.snap(self.dad)['family'];self.call(self.dad,'family.update',{'version':f['version'],'mode':'all'})
+  t=next(x for x in self.snap(self.dad)['tasks'] if x.get('template_key'))
+  r=self.call(self.dad,'task.update',{'id':t['id'],'version':t['version'],'status':'done'})
+  p=self.snap(self.mom)['pregnancy']
+  self.call(self.mom,'pregnancy.event',{'id':p['id'],'version':p['version'],'event':'pause'})
+  same=next(x for x in self.snap(self.dad)['tasks'] if x['id']==t['id'])
+  self.assertEqual(same['version'],t['version']+1)
+  self.assertEqual(same['status'],'pending')
+  p=self.snap(self.mom)['pregnancy']
+  self.call(self.mom,'pregnancy.event',{'id':p['id'],'version':p['version'],'event':'set_edd','date':str(d.date(edd)+datetime.timedelta(days=5))})
+  s=self.snap(self.dad);changed=next(x for x in s['tasks'] if x['id']==t['id'])
+  self.assertEqual(changed['status'],'in_progress')
+  self.assertEqual(d.date(changed['due_date']),d.date(t['due_date'])+datetime.timedelta(days=5))
+  self.assertEqual(next(x for x in s['approvals'] if x['id']==r['approval_id'])['status'],'cancelled')
 if __name__=='__main__':unittest.main(verbosity=2)

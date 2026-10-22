@@ -43,3 +43,40 @@ class HttpTests(unittest.TestCase):
  def test_unauthenticated_state(self):self.assertEqual(self.req('/api/state?family_id=guess')[0],401)
  def test_admin_is_not_family_coordinator(self):
   a=self.account('http-admin-test');self.assertEqual(self.req('/api/admin',token=a['session_token'])[0],403)
+ def test_action_retry_rejects_changed_content(self):
+  a=self.account('http-retry');token=a['session_token'];csrf=a['csrf']
+  _,f=self.req('/api/families',{'name':'重试测试'},token,csrf);fid=f['family_id']
+  command={'family_id':fid,'action':'task.create','request_id':'bound-request','data':{'title':'只创建一次'}}
+  status,first=self.req('/api/action',command,token,csrf);self.assertEqual(status,200)
+  self.assertEqual(self.req('/api/action',command,token,csrf),(200,first))
+  command['data']={'title':'不同内容'}
+  self.assertEqual(self.req('/api/action',command,token,csrf)[0],409)
+  command['request_id']='invalid-data';command['data']=[]
+  self.assertEqual(self.req('/api/action',command,token,csrf)[0],400)
+  _,s=self.req('/api/state?family_id='+fid,token=token)
+  self.assertEqual(len(s['tasks']),5)
+
+ def test_revocation_export_and_subject_deletion(self):
+  dad=self.account('http-cleanup-dad');mom=self.account('http-cleanup-mom')
+  dt,dc=dad['session_token'],dad['csrf'];mt,mc=mom['session_token'],mom['csrf']
+  _,f=self.req('/api/families',{'name':'删除测试'},dt,dc);fid=f['family_id'];seq=0
+  def act(token,csrf,action,data):
+   nonlocal seq
+   seq+=1
+   status,r=self.req('/api/action',{'family_id':fid,'action':action,'data':data,'request_id':'cleanup-'+str(seq)},token,csrf)
+   self.assertEqual(status,200,r);return r
+  inv=act(dt,dc,'invite.create',{'role':'mom'})
+  self.assertEqual(self.req('/api/join',{'code':inv['invite_code']},mt,mc)[0],200)
+  act(mt,mc,'pregnancy.create',{'consent':True})
+  for scope in ('health_read','health_edit'):act(mt,mc,'consent.update',{'scope':scope,'grantee':dad['user']['id'],'enabled':True})
+  act(dt,dc,'appointment.create',{'title':'合成预约','date':'2026-10-22'})
+  _,before=self.req('/api/export?family_id='+fid,token=dt)
+  self.assertEqual(len(before['appointments']),1)
+  act(mt,mc,'consent.update',{'scope':'health_read','grantee':dad['user']['id'],'enabled':False})
+  _,after=self.req('/api/export?family_id='+fid,token=dt)
+  self.assertEqual(after['appointments'],[]);self.assertEqual(after['pregnancies'],[])
+  self.assertEqual(self.req('/api/account/delete',{'password':'wrong'},mt,mc)[0],403)
+  self.assertEqual(self.req('/api/account/delete',{'password':'test-password-123'},mt,mc)[0],200)
+  self.assertEqual(self.req('/api/me',token=mt)[0],401)
+  status,s=self.req('/api/state?family_id='+fid,token=dt)
+  self.assertEqual(status,200);self.assertIsNone(s['pregnancy']);self.assertEqual(len(s['members']),1)

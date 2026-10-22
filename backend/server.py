@@ -181,12 +181,7 @@ class Handler(BaseHTTPRequestHandler):
     elif path=='/api/join':d.rate(c,'join:'+user,8,600);result=d.join(c,user,data.get('code'))
     elif path=='/api/action':
      fid=d.text(data.get('family_id'),64);action=d.text(data.get('action'),80);key=d.text(data.get('request_id'),80)
-     prior=c.execute('SELECT result FROM requests WHERE user_id=? AND key=?',(user,key)).fetchone()
-     # Recheck membership even on retries.
-     d.member(c,fid,user)
-     if prior:result=json.loads(prior['result'])
-     else:
-      result=d.mutate(c,user,fid,action,data.get('data',{}));c.execute('INSERT INTO requests VALUES(?,?,?,?)',(user,key,d.dumps(result),d.now()))
+     result=d.command(c,user,fid,action,key,data.get('data',{}))
     elif path=='/api/knowledge':
      # Local operator role is configured outside the web UI. A family coordinator is not a medical reviewer.
      if user!=os.environ.get('ADMIN_USER_ID'):raise d.Problem(403,'需要系统内容管理员权限')
@@ -200,16 +195,7 @@ class Handler(BaseHTTPRequestHandler):
     elif path=='/api/orders':
      d.member(c,data.get('family_id'),user,('dad',));raise d.Problem(503,'支付尚未配置，不会创建假订单或授予虚假权益；本机自用不收费')
     elif path=='/api/account/delete':
-     r=c.execute('SELECT password FROM users WHERE id=?',(user,)).fetchone()
-     if not d.password_ok(data.get('password'),r['password']):raise d.Problem(403,'请重新输入账号密码以确认')
-     if c.execute("SELECT 1 FROM memberships WHERE user_id=? AND role='dad' AND active=1",(user,)).fetchone():raise d.Problem(409,'请先转交家庭统筹权限，再删除账号')
-     owned_pregnancies={p['id'] for p in d.rows(c,'pregnancy') if p.get('subject_id')==user}
-     for family in d.rows(c,'family'):
-      if family.get('active_pregnancy_id') in owned_pregnancies:family['active_pregnancy_id']=None;d.put(c,'family',family,family['id'])
-     for k in ('pregnancy','appointment','chat','consent','baby','wechat_identity'):
-      for obj in d.rows(c,k):
-       if obj.get('subject_id')==user or obj.get('owner')==user or obj.get('subject')==user or obj.get('grantee')==user or obj.get('user_id')==user or obj.get('pregnancy_id') in owned_pregnancies:c.execute('DELETE FROM records WHERE kind=? AND id=?',(k,obj['id']))
-     c.execute('DELETE FROM requests WHERE user_id=?',(user,));c.execute('DELETE FROM users WHERE id=?',(user,));result={'ok':True};cookie=self.cookie('',True)
+     result=d.delete_account(c,user,data.get('password'));cookie=self.cookie('',True)
     else:raise d.Problem(404,'接口不存在')
    self.respond(result,cookie=cookie)
   except d.Problem as e:self.respond({'error':e.message},e.status)
