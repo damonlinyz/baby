@@ -84,6 +84,8 @@ node --check backend/payment-crypto.mjs
 
 重复任务的生成窗口、停止规则及验证方式见 [重复家务任务](docs/重复家务任务.md)。
 
+待产物品的完整编辑与可逆删除说明见 [待产清单维护](docs/待产清单维护.md)。
+
 ## 项目结构
 
 ```text

@@ -149,3 +149,34 @@ test('browser late 401 after a new login does not dispatch sign-out',async()=>{
  const old=api('/state');await api('/login',{login:'new'});gate.resolve(response(401,{error:'expired old session'}));
  await assert.rejects(old,e=>e.stale);assert.equal(events.includes('signed-out'),false);assert.equal(vm.runInContext('csrf',context),'new-session');
 });
+
+test('WeChat packing form submits edited quantity, priority, category, owner and captured version',async()=>{
+ const {page,calls}=wechat(async o=>({statusCode:200,data:o.url.endsWith('/action')?{id:'item'}:snapshot()}));
+ page.data.state={...snapshot(),role:'dad',items:[{id:'item',version:8,name:'证件',note:'原备注',quantity:2,pack:'证件资料包',level:'必备',assignee:'mom'}]};
+ page.editItem({currentTarget:{dataset:{id:'item'}}});assert.equal(page.data.form.quantity,2);assert.equal(page.data.form.level,0);
+ page.field({currentTarget:{dataset:{key:'quantity'}},detail:{value:'4'}});page.choose({currentTarget:{dataset:{key:'level'}},detail:{value:'2'}});
+ page.addItem();await settled(page);const command=calls.find(c=>c.path.endsWith('/action')).data;
+ assert.equal(command.action,'item.update');assert.deepEqual(command.data,{id:'item',version:8,name:'证件',note:'原备注',quantity:4,pack:'证件资料包',level:'可选',assignee:'mom'});
+ assert.equal(page.data.modal,'');
+});
+
+test('WeChat packing delete cancellation sends nothing and accepted delete uses draft version',async()=>{
+ const {page,calls,wx}=wechat(async o=>({statusCode:200,data:o.url.endsWith('/action')?{id:'item'}:snapshot()}));
+ page.data.form={id:'item',version:7};wx.showModal=o=>o.success({confirm:false});page.deleteItem();await settled(page);assert.equal(calls.length,0);
+ wx.showModal=o=>o.success({confirm:true});page.deleteItem();await settled(page);
+ assert.deepEqual(calls[0].data.data,{id:'item',version:7});assert.equal(calls[0].data.action,'item.delete');
+});
+
+test('WeChat restore requires choosing a departed owner replacement before sending',async()=>{
+ const {page,calls,toasts}=wechat(async o=>({statusCode:200,data:o.url.endsWith('/action')?{id:'item'}:snapshot()}));
+ page.data.state={...snapshot(),deleted_items:[{id:'item',version:9,name:'衣物',assignee:'departed'}]};
+ page.openRestoreItem({currentTarget:{dataset:{id:'item'}}});page.restoreItem();await settled(page);
+ assert.equal(calls.length,0);assert.match(toasts.at(-1).title,/重新选择/);
+ page.choose({currentTarget:{dataset:{key:'assignee'}},detail:{value:'0'}});page.restoreItem();await settled(page);
+ assert.equal(calls[0].data.action,'item.restore');assert.deepEqual(calls[0].data.data,{id:'item',version:9,assignee:'mom'});
+});
+
+test('WeChat packing quantity rejects fractions before creating a command',async()=>{
+ const {page,calls,toasts}=wechat(async()=>{throw Error('unexpected network')});page.data.form={name:'合成物品',quantity:'1.5'};
+ page.addItem();await settled(page);assert.equal(calls.length,0);assert.match(toasts.at(-1).title,/整数/);
+});

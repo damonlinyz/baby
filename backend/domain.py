@@ -1,6 +1,6 @@
 """SQLite domain layer. Mutations run under BEGIN IMMEDIATE; callers supply authenticated actor."""
 import os,json,sqlite3,secrets,hashlib,hmac,time,datetime,contextlib
-import templates,dates,lifecycle,recurring
+import templates,dates,lifecycle,recurring,bag
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent.parent
 DB=Path(os.environ.get('BABA_DB',str(ROOT/'private'/'baba.sqlite3')))
@@ -265,7 +265,7 @@ def snapshot(c,user,fid):
  me=member(c,fid,user);f=get(c,'family',fid)
  expire_approvals(c,fid)
  members=[dict(r) for r in c.execute('SELECT u.id,u.name,m.role FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.family_id=? AND m.active=1',(fid,))]
- tasks=rows(c,'task',fid);items=rows(c,'item',fid)
+ tasks=rows(c,'task',fid);all_items=rows(c,'item',fid);items=[i for i in all_items if not i.get('deleted')]
  tasks=[t for t in tasks if can_view_task(c,fid,user,t)]
  if me['role']=='member':tasks=[t for t in tasks if t['assignee']==user];items=[i for i in items if i['assignee']==user]
  p=get(c,'pregnancy',f['active_pregnancy_id']) if f.get('active_pregnancy_id') else None
@@ -283,7 +283,7 @@ def snapshot(c,user,fid):
  orders=[o for o in rows(c,'order',fid) if o['payer']==user]
  order_ids={o['id'] for o in orders}
  refunds=[r for r in rows(c,'refund',fid) if r['order_id'] in order_ids]
- return {'calendar_date':str(today(f.get('timezone',dates.DEFAULT_TIMEZONE))),'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'task_series':[s for s in rows(c,'task_series',fid) if me['role']!='member' or s['assignee']==user],'items':items,'pregnancy':p,'babies':babies,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and can_view_notification(c,fid,user,n)], 'reminder_preferences':next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==user),{'enabled':True}), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'refunds':refunds,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
+ return {'calendar_date':str(today(f.get('timezone',dates.DEFAULT_TIMEZONE))),'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'task_series':[s for s in rows(c,'task_series',fid) if me['role']!='member' or s['assignee']==user],'items':items,'deleted_items':[i for i in all_items if i.get('deleted')] if me['role']=='dad' else [],'pregnancy':p,'babies':babies,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and can_view_notification(c,fid,user,n)], 'reminder_preferences':next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==user),{'enabled':True}), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'refunds':refunds,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
 def propose(c,fid,user,resource,action,payload,target=None):
  mom=c.execute("SELECT user_id FROM memberships WHERE family_id=? AND role='mom' AND active=1",(fid,)).fetchone()
  if not mom:raise Problem(409,'需要妈妈加入家庭后才能启用确认')
@@ -540,7 +540,9 @@ def mutate(c,user,fid,action,data):
   if role!='dad':raise Problem(403,'只有统筹者可以停止重复安排')
   series=require_active(c,fid,'task_series',data.get('id'));version(series,data)
   return recurring.stop(c,fid,series,user)
- elif action in ('task.create','item.create','appointment.create'):
+ elif action in ('item.create','item.update','item.delete','item.restore'):
+  return bag.mutate(c,user,fid,action,data)
+ elif action in ('task.create','appointment.create'):
   if action=='task.create' and data.get('repeat','none')!='none':return recurring.create(c,fid,user,data)
   if action=='appointment.create':
    if role not in ('dad','mom'):raise Problem(403,'没有预约管理权限')
@@ -555,10 +557,9 @@ def mutate(c,user,fid,action,data):
    due=data.get('due_date') or None
    if due:date(due)
    if action=='task.create':obj={'id':uid(),'title':text(data.get('title'),100),'note':str(data.get('note',''))[:500],'type':data.get('type','自定义'),'assignee':assignee,'status':'todo','due_date':due,'created_at':now(),'pregnancy_id':f.get('active_pregnancy_id'),'stage':get(c,'pregnancy',f['active_pregnancy_id'])['state'] if f.get('active_pregnancy_id') else None};put(c,'task',obj,fid)
-   else:obj={'id':uid(),'name':text(data.get('name'),100),'note':str(data.get('note',''))[:500],'pack':data.get('pack','妈妈入院包'),'quantity':max(1,min(100,int(data.get('quantity',1)))),'assignee':assignee,'status':'todo','level':data.get('level','建议')};put(c,'item',obj,fid)
    if assignee!=user:notify(c,fid,assignee,'你收到一项新的家庭安排')
   audit(c,fid,user,action,{'id':obj['id']});return {'id':obj['id']}
- elif action in ('task.update','item.update','appointment.update'):
+ elif action in ('task.update','appointment.update'):
   kind=action.split('.')[0];obj=require_active(c,fid,kind,data.get('id'));version(obj,data);original=dict(obj)
   if kind=='task' and not can_view_task(c,fid,user,obj):raise Problem(403,'此事项需要相应资料的查看授权')
   if kind=='task' and obj.get('series_id') and role=='member' and obj['assignee']!=user:raise Problem(403,'只能操作自己负责的重复任务实例')
