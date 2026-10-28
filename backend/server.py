@@ -8,7 +8,7 @@ import payments,lifecycle
 ROOT=Path(__file__).resolve().parent.parent
 PORT=int(os.environ.get('PORT','8766'));HOST=os.environ.get('HOST','127.0.0.1')
 PUBLIC_ORIGIN=os.environ.get('PUBLIC_ORIGIN',f'http://127.0.0.1:{PORT}')
-STATIC={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/style.css':'style.css','/api-client.js':'api-client.js','/native-payment.js':'native-payment.js','/demo/':'demo/index.html','/demo/app.js':'demo/app.js','/demo/style.css':'demo/style.css'}
+STATIC={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/style.css':'style.css','/request-recovery.js':'clients/weapp/lib/recovery.js','/api-client.js':'api-client.js','/native-payment.js':'native-payment.js','/demo/':'demo/index.html','/demo/app.js':'demo/app.js','/demo/style.css':'demo/style.css'}
 PRODUCTS=[{'sku':'core','name':'核心产品买断','price_fen':12800,'description':'核心产品及核心更新，赠首个 30 天有限额 AI'}, {'sku':'ai30','name':'AI 30 天包','price_fen':2500,'description':'拟定：300 次成功问答，5 份周简报；正式开售前需成本验证'}]
 def integrations():return {'ai':bool(os.environ.get('AI_API_KEY') and os.environ.get('AI_BASE_URL') and os.environ.get('AI_MODEL')),'wechat':payments.configured('wechat'),'alipay':payments.configured('alipay'),'wechat_login':bool(os.environ.get('WX_APP_ID') and os.environ.get('WX_APP_SECRET')),'push':False,'payment_mode':'configured' if payments.configured('wechat') or payments.configured('alipay') else 'not_configured','service_mode':os.environ.get('SERVICE_MODE','self_hosted'),'sales_enabled':os.environ.get('PAYMENTS_ENABLED')=='1'}
 

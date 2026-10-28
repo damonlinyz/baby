@@ -8,3 +8,5 @@
 textarea{font:inherit;width:100%;min-height:90px;padding:12px;border:1px solid #e2e4d5;background:#fafaf4;border-radius:8px;color:#626b55;resize:vertical}.check:disabled{cursor:default;opacity:.5}.consent-section{padding:18px 0;border-bottom:1px solid var(--line);font-size:13px}.consent-toggle{display:flex;align-items:center;justify-content:space-between;gap:15px;font-size:12px;line-height:1.8;color:#89917a;margin:18px 0}.consent-toggle input{accent-color:#849772;width:18px;height:18px;flex-shrink:0}button:disabled{cursor:default}#main:empty:before{content:'正在打开你的小宇宙…';display:block;padding:70px;text-align:center;color:#8b947c}
 
 [hidden]{display:none!important}
+
+.recovery-status{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);max-width:90vw;padding:14px 18px;background:#fff8e8;border:1px solid #e8d6ad;border-radius:12px;box-shadow:0 5px 25px #5552;z-index:1001;font-size:13px;display:flex;align-items:center;gap:14px}
