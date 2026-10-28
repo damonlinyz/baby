@@ -1,0 +1,18 @@
+[Unit]
+Description=Check freshness and integrity of encrypted Baba backups
+
+[Service]
+Type=oneshot
+User=baba
+Group=baba
+WorkingDirectory=/opt/baba
+EnvironmentFile=/etc/baba-backup/common.env
+ExecStart=/usr/bin/python3 /opt/baba/backend/backup_jobs.py status --db ${BABA_BACKUP_DB} --directory ${BABA_BACKUP_DIR} --kind full --max-age-hours 26
+ExecStart=/usr/bin/python3 /opt/baba/backend/backup_jobs.py status --db ${BABA_BACKUP_DB} --directory ${BABA_BACKUP_DIR} --kind ledger --max-age-hours 1
+TimeoutStartSec=20min
+UMask=0077
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/baba/private /var/lib/baba/backups

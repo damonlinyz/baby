@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily encrypted Baba database backup
+
+[Timer]
+OnCalendar=*-*-* 03:07:00 Asia/Shanghai
+RandomizedDelaySec=60
+Persistent=true
+Unit=baba-backup@full.service
+
+[Install]
+WantedBy=timers.target

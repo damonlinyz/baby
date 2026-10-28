@@ -1,0 +1,22 @@
+[Unit]
+Description=Baba encrypted %i backup
+
+[Service]
+Type=oneshot
+User=baba
+Group=baba
+WorkingDirectory=/opt/baba
+EnvironmentFile=/etc/baba-backup/common.env
+EnvironmentFile=/etc/baba-backup/%i.env
+ExecStart=/usr/bin/python3 /opt/baba/backend/backup_jobs.py run --db ${BABA_BACKUP_DB} --directory ${BABA_BACKUP_DIR} --recipient-cert ${BABA_BACKUP_CERT} --kind %i --keep ${BABA_BACKUP_KEEP}
+TimeoutStartSec=20min
+UMask=0077
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/baba/private
+ReadWritePaths=/var/lib/baba/backups
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

@@ -1,0 +1,11 @@
+[Unit]
+Description=Independent Baba deletion-ledger backup every 15 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00 UTC
+RandomizedDelaySec=60
+Persistent=true
+Unit=baba-backup@ledger.service
+
+[Install]
+WantedBy=timers.target

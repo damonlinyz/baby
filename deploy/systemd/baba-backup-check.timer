@@ -1,0 +1,10 @@
+[Unit]
+Description=Monitor Baba backup jobs every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=baba-backup-check.service
+
+[Install]
+WantedBy=timers.target
