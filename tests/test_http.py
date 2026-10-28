@@ -129,3 +129,17 @@ class HttpTests(unittest.TestCase):
   self.assertEqual(result['event_count'],1);self.assertTrue(result['filename'].endswith('.ics'));self.assertIn('HTTP 日历事项',result['content'])
   self.assertEqual(self.req(path+'&start=bad',token=token)[0],400)
   self.req('/api/logout',{},token,csrf);self.assertEqual(self.req(path,token=token)[0],401)
+
+ def test_weekly_report_requires_membership_recomputes_facts_and_is_not_cached(self):
+  dad=self.account('http-weekly-dad');other=self.account('http-weekly-outsider');token=dad['session_token'];csrf=dad['csrf']
+  _,family=self.req('/api/families',{'name':'每周验证'},token,csrf);fid=family['family_id'];path='/api/report?family_id='+fid
+  self.assertEqual(self.req(path)[0],401);self.assertEqual(self.req(path,token=other['session_token'])[0],403)
+  _,state=self.req('/api/state?family_id='+fid,token=token);task=state['tasks'][0]
+  status,_=self.req('/api/action',{'family_id':fid,'action':'task.update','request_id':'weekly-done','data':{'id':task['id'],'version':task['version'],'status':'done'}},token,csrf);self.assertEqual(status,200)
+  with urllib.request.urlopen(urllib.request.Request(self.base+path,headers={'Authorization':'Bearer '+token})) as response:
+   self.assertEqual(response.headers['Cache-Control'],'no-store');report=json.load(response)
+  self.assertEqual(report['counts'],{'tasks':1,'items':0});self.assertTrue(report['is_current'])
+  _,historical=self.req(path+'&week='+report['previous_week'],token=token);self.assertEqual(historical['counts']['tasks'],0);self.assertEqual(historical['next_week'],report['week_start'])
+  _,state=self.req('/api/state?family_id='+fid,token=token);self.assertEqual(state['weekly_report'],report)
+  self.assertEqual(self.req(path+'&week=bad',token=token)[0],400);self.assertEqual(self.req(path+'&week=9999-12-31',token=token)[0],400)
+  self.req('/api/logout',{},token,csrf);self.assertEqual(self.req(path,token=token)[0],401)

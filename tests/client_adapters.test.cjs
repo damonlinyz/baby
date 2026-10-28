@@ -207,3 +207,23 @@ test('WeChat startup removes only abandoned calendar export files',async()=>{
  wx.getFileSystemManager=()=>({readdir:o=>o.success({files:['baba-calendar-123-abc.ics','other.ics','baba-session','../baba-calendar-1-x.ics','baba-calendar-123-abc.ics.keep']}),unlink:o=>{removed.push(o.filePath);o.success()}});
  await app.cleanCalendarFiles();assert.deepEqual(removed,['/synthetic-private/baba-calendar-123-abc.ics']);
 });
+
+const weekly=()=>({week_start:'2026-10-26',week_end:'2026-11-01',as_of:'2026-10-28',timezone:'Asia/Shanghai',is_current:true,scope:'visible_family',previous_week:'2026-10-19',next_week:null,counts:{tasks:1,items:0},completed:{tasks:[{id:'done',title:'合成完成',completed_date:'2026-10-27',assignee_name:'合成妈妈'}],items:[]},briefing:{enabled:true,entries:[],knowledge:[]}});
+
+test('WeChat weekly report loads current facts and navigates to the server-normalized historical week',async()=>{
+ const {page,calls}=wechat(async o=>{const r=weekly();if(o.url.includes('week=')){r.week_start='2026-10-19';r.week_end='2026-10-25';r.is_current=false}return {statusCode:200,data:r}});
+ page.data.state=snapshot();page.report();await settled(page);assert.equal(page.data.modal,'report');assert.equal(page.data.weeklyReport.counts.tasks,1);assert.equal(page.data.form.week,'2026-10-26');
+ page.setReportDate({detail:{value:'2026-10-21'}});page.selectedReport();await settled(page);
+ assert.match(calls.at(-1).path,/\/report\?family_id=family&week=2026-10-21$/);assert.equal(page.data.form.week,'2026-10-19');assert.equal(page.data.weeklyReport.is_current,false);
+});
+
+test('WeChat report navigation hides earlier data while loading and discards a switched-family response',async()=>{
+ const gate=deferred();const {page}=wechat(async()=>gate.promise);page.data.state=snapshot();page.data.weeklyReport=weekly();
+ const result=page.loadReport('2026-10-19');assert.equal(page.data.weeklyReport,null);await new Promise(setImmediate);page.data.familyId='another-family';gate.resolve({statusCode:200,data:weekly()});await assert.rejects(result,e=>e.stale);assert.equal(page.data.weeklyReport,null);
+});
+
+test('WeChat denied report clears old details and foreground reload closes the report',async()=>{
+ const {page}=wechat(async o=>o.url.includes('/report?')?{statusCode:403,data:{error:'access revoked'}}:{statusCode:200,data:snapshot()});page.data.state=snapshot();page.data.weeklyReport=weekly();
+ page.report();await settled(page);assert.equal(page.data.weeklyReport,null);assert.equal(page.data.modal,'');
+ page.data.weeklyReport=weekly();page.data.modal='report';page._shown=true;page.onShow();await settled(page);assert.equal(page.data.weeklyReport,null);assert.equal(page.data.modal,'');
+});
