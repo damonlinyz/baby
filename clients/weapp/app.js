@@ -4,7 +4,13 @@ App({
  onLaunch(){
   this.globalData.token=wx.getStorageSync('baba-session')||'';
   this.globalData.csrf=wx.getStorageSync('baba-csrf')||'';
+  this.calendarCleanup=this.cleanCalendarFiles();
   this.client();
+ },
+ cleanCalendarFiles(){
+  if(!wx.getFileSystemManager||!wx.env?.USER_DATA_PATH)return Promise.resolve();
+  const fs=wx.getFileSystemManager(),directory=wx.env.USER_DATA_PATH;
+  return new Promise(resolve=>fs.readdir({dirPath:directory,success:r=>Promise.all((r.files||[]).filter(name=>/^baba-calendar-\d+-[a-z0-9]+\.ics$/.test(name)).map(name=>new Promise(done=>fs.unlink({filePath:directory+'/'+name,success:done,fail:done})))).then(resolve),fail:resolve}));
  },
  client(){
   if(this._recovery)return this._recovery;

@@ -118,3 +118,14 @@ class HttpTests(unittest.TestCase):
   p=state(mt)['pregnancy'];status,_=self.req('/api/pregnancy/preview',{'family_id':fid,'data':{'id':p['id'],'version':p['version'],'event':'correct_birth_record','birth_event_id':p['birth_event_id'],'confirm_correction':True,'reason':'合成误录'}},mt,mc);self.assertEqual(status,409)
   f=state(dt)['family'];act(dt,dc,'family.update',{'version':f['version'],'timezone':'Asia/Tokyo'})
   self.assertEqual(state(mt)['pregnancy']['timeline']['timezone'],'Asia/Tokyo')
+
+ def test_calendar_route_requires_current_membership_and_never_caches_export(self):
+  dad=self.account('http-calendar-dad');other=self.account('http-calendar-outsider');token=dad['session_token'];csrf=dad['csrf']
+  _,family=self.req('/api/families',{'name':'日历验证'},token,csrf);fid=family['family_id'];path='/api/calendar?family_id='+fid
+  self.assertEqual(self.req(path)[0],401);self.assertEqual(self.req(path,token=other['session_token'])[0],403)
+  self.req('/api/action',{'family_id':fid,'action':'task.create','request_id':'calendar-task','data':{'title':'HTTP 日历事项','due_date':str(datetime.date.today())}},token,csrf)
+  with urllib.request.urlopen(urllib.request.Request(self.base+path+'&start='+str(datetime.date.today())+'&end='+str(datetime.date.today()),headers={'Authorization':'Bearer '+token})) as response:
+   self.assertEqual(response.headers['Cache-Control'],'no-store');result=json.load(response)
+  self.assertEqual(result['event_count'],1);self.assertTrue(result['filename'].endswith('.ics'));self.assertIn('HTTP 日历事项',result['content'])
+  self.assertEqual(self.req(path+'&start=bad',token=token)[0],400)
+  self.req('/api/logout',{},token,csrf);self.assertEqual(self.req(path,token=token)[0],401)

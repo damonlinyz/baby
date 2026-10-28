@@ -180,3 +180,30 @@ test('WeChat packing quantity rejects fractions before creating a command',async
  const {page,calls,toasts}=wechat(async()=>{throw Error('unexpected network')});page.data.form={name:'合成物品',quantity:'1.5'};
  page.addItem();await settled(page);assert.equal(calls.length,0);assert.match(toasts.at(-1).title,/整数/);
 });
+
+test('WeChat calendar export requires confirmation, shares an ICS file and removes the temporary copy',async()=>{
+ const {page,calls,wx}=wechat(async()=>({statusCode:200,data:{filename:'baba-calendar.ics',content:'BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n',event_count:0}}));
+ const writes=[],removes=[],shares=[];wx.env={USER_DATA_PATH:'/synthetic-private'};
+ wx.getFileSystemManager=()=>({writeFile:o=>{writes.push(o);o.success()},unlink:o=>{removes.push(o.filePath);o.success()}});
+ wx.shareFileMessage=o=>{shares.push(o);o.success()};page.data.modal='calendar';page.data.form={start:'2026-10-28',end:'2026-11-28'};
+ page.exportCalendar();await settled(page);assert.equal(calls.length,0);
+ page.calendarConsent({detail:{value:['yes']}});page.exportCalendar();await settled(page);
+ assert.match(calls[0].path,/\/calendar\?family_id=family&start=2026-10-28&end=2026-11-28$/);
+ assert.equal(writes.length,1);assert.equal(writes[0].encoding,'utf8');assert.equal(shares[0].filePath,writes[0].filePath);assert.equal(shares[0].fileName,'baba-calendar.ics');assert.deepEqual(removes,[writes[0].filePath]);
+});
+
+test('WeChat calendar file is removed on cancellation and cannot be shared after session revocation',async()=>{
+ const {page,app,wx}=wechat(async()=>({statusCode:200,data:{filename:'calendar.ics',content:'synthetic-calendar'}}));
+ const removes=[],shares=[];let revoke=false;wx.env={USER_DATA_PATH:'/synthetic-private'};
+ wx.getFileSystemManager=()=>({writeFile:o=>{if(revoke)app.clearSession();o.success()},unlink:o=>{removes.push(o.filePath);o.success()}});
+ wx.shareFileMessage=o=>{shares.push(o);o.fail({errMsg:'shareFileMessage:fail cancel'})};
+ page.data.form={start:'2026-10-28',end:'2026-10-28',confirmed:true};page.exportCalendar();await settled(page);assert.equal(shares.length,1);assert.equal(removes.length,1);
+ revoke=true;page.data.form={start:'2026-10-28',end:'2026-10-28',confirmed:true};page.exportCalendar();await settled(page);
+ assert.equal(shares.length,1);assert.equal(removes.length,2);assert.equal(page.data.auth,false);
+});
+
+test('WeChat startup removes only abandoned calendar export files',async()=>{
+ const {app,wx}=wechat(async()=>{throw Error('unexpected request')});const removed=[];wx.env={USER_DATA_PATH:'/synthetic-private'};
+ wx.getFileSystemManager=()=>({readdir:o=>o.success({files:['baba-calendar-123-abc.ics','other.ics','baba-session','../baba-calendar-1-x.ics','baba-calendar-123-abc.ics.keep']}),unlink:o=>{removed.push(o.filePath);o.success()}});
+ await app.cleanCalendarFiles();assert.deepEqual(removed,['/synthetic-private/baba-calendar-123-abc.ics']);
+});

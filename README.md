@@ -86,6 +86,8 @@ node --check backend/payment-crypto.mjs
 
 待产物品的完整编辑与可逆删除说明见 [待产清单维护](docs/待产清单维护.md)。
 
+当前可见任务和预约的 ICS 文件说明见 [日历导出](docs/日历导出.md)，导入后的日历副本需自行核对更新。
+
 ## 项目结构
 
 ```text
