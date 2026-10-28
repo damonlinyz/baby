@@ -12,7 +12,8 @@ import urllib.request
 from zoneinfo import ZoneInfo
 
 
-def main():
+def main(scenario='recovery'):
+ if scenario not in ('recovery','recurring'):raise ValueError('unknown browser scenario')
  root=Path(__file__).resolve().parents[1]
  with tempfile.TemporaryDirectory(prefix='baba-browser-') as directory:
   with socket.socket() as listener:
@@ -35,7 +36,7 @@ def main():
      except (OSError,urllib.error.URLError):pass
      time.sleep(.05)
     else:raise RuntimeError('temporary server did not become ready')
-    subprocess.run(['node',str(root/'tests/browser/recovery.cjs')],cwd=root,env=env,check=True,timeout=120)
+    subprocess.run(['node',str(root/'tests/browser'/(scenario+'.cjs'))],cwd=root,env=env,check=True,timeout=120)
    finally:
     server.terminate()
     try:server.wait(timeout=5)

@@ -15,7 +15,7 @@ function wechat(respond){
  const calls=[],toasts=[];
  const wx={
   getStorageSync:key=>stored.get(key),setStorageSync:(key,value)=>stored.set(key,value),removeStorageSync:key=>stored.delete(key),
-  showToast:value=>toasts.push(value),
+  showToast:value=>toasts.push(value),showModal:options=>options.success({confirm:true}),
   request(options){calls.push({path:options.url,data:copy(options.data===undefined?null:options.data)});Promise.resolve().then(()=>respond(options)).then(result=>options.success(result),error=>options.fail(error))}
  };
  const context=vm.createContext({wx,require:()=>({create:options=>Recovery.create({...options,delay:async()=>{}})}),
@@ -26,10 +26,10 @@ function wechat(respond){
  app.onLaunch();
  vm.runInContext(fs.readFileSync(path.join(root,'clients/weapp/pages/main/main.js'),'utf8'),context);
  page.data.familyId='family';page.data.auth=true;page.data.user={id:'mom'};
- return {app,page,stored,calls,toasts};
+ return {app,page,stored,calls,toasts,wx};
 }
 async function settled(page){for(let i=0;i<50;i++){await new Promise(setImmediate);if(!page.data.busy)return}assert.fail('page did not settle')}
-const snapshot=()=>({orders:[],refunds:[],tasks:[],items:[],approvals:[],members:[{id:'mom',name:'合成妈妈'}],
+const snapshot=()=>({calendar_date:'2026-10-28',task_series:[],orders:[],refunds:[],tasks:[],items:[],approvals:[],members:[{id:'mom',name:'合成妈妈'}],
  user:{id:'mom'},family:{id:'family',coordinator:'dad',mode:'off'},consents:[],babies:[],knowledge:[],
  pregnancy:{id:'pregnancy',restricted:true},role:'mom'});
 
@@ -97,6 +97,34 @@ test('older same-account WeChat snapshot cannot overwrite newer revoked permissi
  const privateState=snapshot();privateState.pregnancy={id:'pregnancy',edd:'private-date',timeline:{title:'older-title'}};
  gate.resolve({statusCode:200,data:privateState});await assert.rejects(old,e=>e.stale);
  assert.equal(page.data.state.pregnancy.restricted,true);assert.equal(JSON.stringify(page.data.state).includes('private-date'),false);
+});
+
+test('WeChat recurring task creation sends typed interval and explicit calendar dates',async()=>{
+ const {page,calls}=wechat(async options=>({statusCode:200,data:options.url.endsWith('/action')?{series_id:'series'}:snapshot()}));
+ page.data.state=snapshot();page.data.form={title:'厨房家务',repeat:2,repeat_every:'2',due_date:'2026-10-28',repeat_until:'2026-11-25',assignee:0};
+ page.addTask();await settled(page);
+ const command=calls.find(c=>c.path.endsWith('/action')).data;
+ assert.equal(command.action,'task.create');assert.equal(command.data.repeat,'weekly');assert.equal(command.data.repeat_every,2);
+ assert.equal(command.data.due_date,'2026-10-28');assert.equal(command.data.repeat_until,'2026-11-25');assert.equal(command.data.assignee,'mom');
+});
+
+test('WeChat recurring picker uses public family calendar date with private pregnancy',()=>{
+ const {page}=wechat(async()=>({statusCode:200,data:snapshot()}));page.data.state=snapshot();
+ page.choose({currentTarget:{dataset:{key:'repeat'}},detail:{value:'1'}});
+ assert.equal(page.data.form.due_date,'2026-10-28');assert.equal(page.data.state.pregnancy.restricted,true);
+});
+
+test('WeChat series stop respects cancellation and submits current series version',async()=>{
+ const {page,calls,wx,toasts}=wechat(async options=>({statusCode:200,data:options.url.endsWith('/action')?{id:'series'}:snapshot()}));
+ page.data.state={...snapshot(),task_series:[{id:'series',version:4,status:'active'}]};
+ wx.showModal=options=>options.success({confirm:false});page.stopSeries({currentTarget:{dataset:{id:'series'}}});await settled(page);
+ assert.equal(calls.length,0);
+ wx.showModal=options=>options.success({confirm:true});page.stopSeries({currentTarget:{dataset:{id:'series'}}});await settled(page);
+ const command=calls.find(c=>c.path.endsWith('/action')).data;
+ assert.equal(command.action,'task_series.stop');assert.deepEqual(command.data,{id:'series',version:4});
+ const count=calls.length;page.data.state.tasks=[{id:'stopped',status:'cancelled',series_stopped:true}];
+ page.completeTask({currentTarget:{dataset:{id:'stopped'}}});await settled(page);
+ assert.equal(calls.length,count);assert.equal(toasts.at(-1).title,'此重复安排已停止');
 });
 
 function browser(respond){

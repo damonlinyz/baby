@@ -1,6 +1,6 @@
 """SQLite domain layer. Mutations run under BEGIN IMMEDIATE; callers supply authenticated actor."""
 import os,json,sqlite3,secrets,hashlib,hmac,time,datetime,contextlib
-import templates,dates,lifecycle
+import templates,dates,lifecycle,recurring
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent.parent
 DB=Path(os.environ.get('BABA_DB',str(ROOT/'private'/'baba.sqlite3')))
@@ -227,6 +227,7 @@ def erase_account(c,user):
   cancel_transfers(c,fid,user);cancel_member_approvals(c,fid,user)
   m=c.execute('SELECT role,active FROM memberships WHERE family_id=? AND user_id=?',(fid,user)).fetchone()
   if m['role']=='mom' and m['active']:apply_policy(c,fid,'off')
+  recurring.stop_for_member(c,fid,user,user,'assignee_deleted')
  for f in rows(c,'family'):
   if f.get('active_pregnancy_id') in owned:f['active_pregnancy_id']=None;put(c,'family',f,f['id'])
  removed=set(owned)
@@ -282,7 +283,7 @@ def snapshot(c,user,fid):
  orders=[o for o in rows(c,'order',fid) if o['payer']==user]
  order_ids={o['id'] for o in orders}
  refunds=[r for r in rows(c,'refund',fid) if r['order_id'] in order_ids]
- return {'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'items':items,'pregnancy':p,'babies':babies,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and can_view_notification(c,fid,user,n)], 'reminder_preferences':next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==user),{'enabled':True}), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'refunds':refunds,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
+ return {'calendar_date':str(today(f.get('timezone',dates.DEFAULT_TIMEZONE))),'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'task_series':[s for s in rows(c,'task_series',fid) if me['role']!='member' or s['assignee']==user],'items':items,'pregnancy':p,'babies':babies,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and can_view_notification(c,fid,user,n)], 'reminder_preferences':next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==user),{'enabled':True}), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'refunds':refunds,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
 def propose(c,fid,user,resource,action,payload,target=None):
  mom=c.execute("SELECT user_id FROM memberships WHERE family_id=? AND role='mom' AND active=1",(fid,)).fetchone()
  if not mom:raise Problem(409,'需要妈妈加入家庭后才能启用确认')
@@ -518,6 +519,7 @@ def mutate(c,user,fid,action,data):
   cancel_transfers(c,fid,target)
   cancel_member_approvals(c,fid,target)
   clean_health_access(c,fid)
+  recurring.stop_for_member(c,fid,target,user,'assignee_left')
   audit(c,fid,user,action,{'user_id':target})
  elif action=='transfer.accept':
   t=require_active(c,fid,'transfer',data.get('id'));version(t,data)
@@ -534,7 +536,12 @@ def mutate(c,user,fid,action,data):
   for g in rows(c,'consent',fid):
    if g['grantee']==t['from'] and g['scope']=='health_edit' and not g.get('revoked_at'):g['revoked_at']=now();put(c,'consent',g,fid)
   audit(c,fid,user,'family.transferred',{'from':t['from'],'to':user})
+ elif action=='task_series.stop':
+  if role!='dad':raise Problem(403,'只有统筹者可以停止重复安排')
+  series=require_active(c,fid,'task_series',data.get('id'));version(series,data)
+  return recurring.stop(c,fid,series,user)
  elif action in ('task.create','item.create','appointment.create'):
+  if action=='task.create' and data.get('repeat','none')!='none':return recurring.create(c,fid,user,data)
   if action=='appointment.create':
    if role not in ('dad','mom'):raise Problem(403,'没有预约管理权限')
    if f.get('active_pregnancy_id'):
@@ -554,6 +561,8 @@ def mutate(c,user,fid,action,data):
  elif action in ('task.update','item.update','appointment.update'):
   kind=action.split('.')[0];obj=require_active(c,fid,kind,data.get('id'));version(obj,data);original=dict(obj)
   if kind=='task' and not can_view_task(c,fid,user,obj):raise Problem(403,'此事项需要相应资料的查看授权')
+  if kind=='task' and obj.get('series_id') and role=='member' and obj['assignee']!=user:raise Problem(403,'只能操作自己负责的重复任务实例')
+  if kind=='task' and obj.get('series_stopped'):raise Problem(409,'此重复安排已停止，实例仅保留历史；需要继续时请新建任务')
   if kind=='appointment':
    if obj['owner']!=user:raise Problem(403,'只有录入人可修改预约')
    if obj.get('pregnancy_id') and not can_edit_health(c,fid,user,get(c,'pregnancy',obj['pregnancy_id'])):raise Problem(403,'健康资料代录授权已失效')
@@ -699,7 +708,7 @@ def tick():
    n={'id':key,'recipient':a['owner'],'title':'有一项预约即将到来，请查看安排','ref':a['id'],'pregnancy_id':a.get('pregnancy_id'),'read':False,'created_at':now()}
    if not c.execute("SELECT 1 FROM records WHERE kind='notification' AND id=?",(n['id'],)).fetchone():put(c,'notification',n,fid)
    a['reminded']=True;put(c,'appointment',a,fid)
-  for f in rows(c,'family'):expire_approvals(c,f['id']);process_outbox(c,f['id'])
+  for f in rows(c,'family'):expire_approvals(c,f['id']);recurring.sync(c,f['id']);process_outbox(c,f['id'])
 
   for task in rows(c,'task'):
    if task['status'] not in ('todo','in_progress') or not task.get('due_date'):continue
