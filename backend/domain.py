@@ -538,10 +538,11 @@ def mutate(c,user,fid,action,data):
   for g in rows(c,'consent',fid):
    if g['grantee']==t['from'] and g['scope']=='health_edit' and not g.get('revoked_at'):g['revoked_at']=now();put(c,'consent',g,fid)
   audit(c,fid,user,'family.transferred',{'from':t['from'],'to':user})
- elif action=='task_series.stop':
-  if role!='dad':raise Problem(403,'只有统筹者可以停止重复安排')
+ elif action in ('task_series.stop','task_series.update','task_series.pause','task_series.resume'):
+  if role!='dad':raise Problem(403,'只有统筹者可以管理重复安排')
   series=require_active(c,fid,'task_series',data.get('id'));version(series,data)
-  return recurring.stop(c,fid,series,user)
+  if action=='task_series.update':return recurring.update(c,fid,series,user,data)
+  return {'task_series.stop':recurring.stop,'task_series.pause':recurring.pause,'task_series.resume':recurring.resume}[action](c,fid,series,user)
  elif action in ('item.create','item.update','item.delete','item.restore'):
   return bag.mutate(c,user,fid,action,data)
  elif action in ('task.create','appointment.create'):
@@ -566,6 +567,7 @@ def mutate(c,user,fid,action,data):
   if kind=='task' and not can_view_task(c,fid,user,obj):raise Problem(403,'此事项需要相应资料的查看授权')
   if kind=='task' and obj.get('series_id') and role=='member' and obj['assignee']!=user:raise Problem(403,'只能操作自己负责的重复任务实例')
   if kind=='task' and obj.get('series_stopped'):raise Problem(409,'此重复安排已停止，实例仅保留历史；需要继续时请新建任务')
+  if kind=='task' and obj.get('series_locked'):raise Problem(409,'此实例已暂停或因规则变更关闭，不能直接修改；请管理重复安排')
   if kind=='appointment':
    if obj['owner']!=user:raise Problem(403,'只有录入人可修改预约')
    if obj.get('pregnancy_id') and not can_edit_health(c,fid,user,get(c,'pregnancy',obj['pregnancy_id'])):raise Problem(403,'健康资料代录授权已失效')
@@ -588,6 +590,7 @@ def mutate(c,user,fid,action,data):
       if key in ('title','name'):text(data[key],100)
       obj[key]=data[key]
       if key=='due_date':obj['user_override']=True
+   if obj.get('series_id') and any(obj.get(k)!=original.get(k) for k in ('title','note','assignee','due_date')):obj['series_override']=True
    if desired!=obj['status']:
     if obj['assignee']!=user:raise Problem(403,'只能提交自己负责事项的执行结果')
     if desired=='done' and f['mode']!='off' and role!='mom' and (f['mode']=='all' or kind=='task'):

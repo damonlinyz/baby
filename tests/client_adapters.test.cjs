@@ -227,3 +227,29 @@ test('WeChat denied report clears old details and foreground reload closes the r
  page.report();await settled(page);assert.equal(page.data.weeklyReport,null);assert.equal(page.data.modal,'');
  page.data.weeklyReport=weekly();page.data.modal='report';page._shown=true;page.onShow();await settled(page);assert.equal(page.data.weeklyReport,null);assert.equal(page.data.modal,'');
 });
+
+test('WeChat recurring rule editor submits captured version, typed interval and new owner',async()=>{
+ const {page,calls}=wechat(async o=>({statusCode:200,data:o.url.endsWith('/action')?{id:'series'}:snapshot()}));
+ page.data.state={...snapshot(),task_series:[{id:'series',version:12,title:'整理',note:'说明',assignee:'mom',frequency:'daily',every:1,start_date:'2026-10-28',until_date:'2026-11-11'}]};
+ page.editSeries({currentTarget:{dataset:{id:'series'}}});page.chooseSeriesFrequency({detail:{value:'1'}});page.field({currentTarget:{dataset:{key:'repeat_every'}},detail:{value:'2'}});page.clearRepeatUntil();
+ page.saveSeries();await settled(page);const command=calls.find(c=>c.path.endsWith('/action')).data;assert.equal(command.action,'task_series.update');
+ assert.deepEqual(command.data,{id:'series',version:12,title:'整理',note:'说明',assignee:'mom',repeat:'weekly',repeat_every:2,due_date:'2026-10-28',repeat_until:null});
+});
+
+test('WeChat recurring rule save respects cancel and rejects fractional intervals before sending',async()=>{
+ const {page,calls,wx,toasts}=wechat(async()=>{throw Error('unexpected network')});page.data.state=snapshot();page.data.form={id:'series',version:2,repeat_every:'1',assignee:0};
+ wx.showModal=o=>o.success({confirm:false});page.saveSeries();await settled(page);assert.equal(calls.length,0);
+ page.data.form.repeat_every='1.5';page.saveSeries();await settled(page);assert.equal(calls.length,0);assert.match(toasts.at(-1).title,/整数/);
+});
+
+test('WeChat recurring pause and resume confirm and use current rule versions',async()=>{
+ const {page,calls,wx}=wechat(async o=>({statusCode:200,data:o.url.endsWith('/action')?{id:'series'}:snapshot()}));
+ page.data.state={...snapshot(),task_series:[{id:'series',version:3,status:'active'}]};wx.showModal=o=>o.success({confirm:false});page.toggleSeries({currentTarget:{dataset:{id:'series'}}});await settled(page);assert.equal(calls.length,0);
+ wx.showModal=o=>o.success({confirm:true});page.toggleSeries({currentTarget:{dataset:{id:'series'}}});await settled(page);assert.equal(calls[0].data.action,'task_series.pause');assert.equal(calls[0].data.data.version,3);
+ page.data.state.task_series=[{id:'series',version:4,status:'paused'}];page.toggleSeries({currentTarget:{dataset:{id:'series'}}});await settled(page);const commands=calls.filter(c=>c.path.endsWith('/action'));assert.equal(commands[1].data.action,'task_series.resume');assert.equal(commands[1].data.data.version,4);
+});
+
+test('WeChat paused or superseded occurrence cannot be completed directly',async()=>{
+ const {page,calls,toasts}=wechat(async()=>{throw Error('unexpected request')});page.data.state={...snapshot(),tasks:[{id:'task',version:3,assignee:'mom',status:'cancelled',series_locked:'paused'}]};
+ page.completeTask({currentTarget:{dataset:{id:'task'}}});await settled(page);assert.equal(calls.length,0);assert.match(toasts.at(-1).title,/暂停或关闭/);
+});
