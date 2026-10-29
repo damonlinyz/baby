@@ -36,7 +36,8 @@ def read_knowledge(c, fid, user, task_id, knowledge_id):
         raise d.Problem(403, '没有查看此任务资料的权限')
     if knowledge_id not in task.get('knowledge_ids', []):
         raise d.Problem(409, '任务关联内容已变更，请重新打开任务')
-    knowledge = next((k for k in d.published_knowledge(c) if k['id'] == knowledge_id), None)
+    import knowledge as library
+    knowledge = next((k for k in library.available(c,fid,user) if k['id'] == knowledge_id), None)
     if not knowledge:
         raise d.Problem(409, '该内容已下架或到期，请重新选择')
     return {'knowledge': knowledge}

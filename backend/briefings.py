@@ -25,7 +25,7 @@ def authorized(c,fid,user,row,snapshot=None):
         if context(s)!=row['context']:return False
         resources={kind:{obj['id']:obj for obj in s[key]} for kind,key in (('task','tasks'),('item','items'),('appointment','appointments'))}
         if any(ref['id'] not in resources[ref['kind']] for ref in row['refs']):return False
-        if not d.citations_current(c,{'citations':row['citations']}):return False
+        if not d.citations_current(c,{'citations':row['citations']},fid,user):return False
         return True
     except d.Problem:return False
 

@@ -110,7 +110,7 @@ def restore(snapshot, ledger, output):
                         d.erase_account(recovered, user)
                         deleted += 1
                     # Restored sessions/grants/invites must not revive previous access.
-                    recovered.execute("DELETE FROM records WHERE kind IN ('share','reminder','subscription','external_delivery','account_recovery','feedback','ai_preferences')")
+                    recovered.execute("DELETE FROM records WHERE kind IN ('share','reminder','subscription','external_delivery','account_recovery','feedback','ai_preferences','support_ticket','admin_receipt')")
                     recovered.execute('DELETE FROM sessions')
                     recovered.execute('DELETE FROM requests')
                     recovered.execute("UPDATE command_requests SET result='{}',invalidated=1")

@@ -4,11 +4,11 @@ import os,sys,json,time,hashlib,secrets,threading,urllib.parse,urllib.request,sq
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 from pathlib import Path
 import domain as d
-import payments,lifecycle,calendar_export,reports,task_details,briefings,sharing,push_notifications,accounts,posters,ai_features,content_library
+import payments,lifecycle,calendar_export,reports,task_details,briefings,sharing,push_notifications,accounts,posters,ai_features,content_library,knowledge,support,operations
 ROOT=Path(__file__).resolve().parent.parent
 PORT=int(os.environ.get('PORT','8766'));HOST=os.environ.get('HOST','127.0.0.1')
 PUBLIC_ORIGIN=os.environ.get('PUBLIC_ORIGIN',f'http://127.0.0.1:{PORT}')
-STATIC={'/features.js':'features.js','/poster.js':'clients/weapp/lib/poster.js','/qrcode.js':'clients/weapp/lib/qrcode.js','/':'index.html','/index.html':'index.html','/app.js':'app.js','/style.css':'style.css','/request-recovery.js':'clients/weapp/lib/recovery.js','/api-client.js':'api-client.js','/native-payment.js':'native-payment.js','/demo/':'demo/index.html','/demo/app.js':'demo/app.js','/demo/style.css':'demo/style.css'}
+STATIC={'/service-features.js':'service-features.js','/features.js':'features.js','/poster.js':'clients/weapp/lib/poster.js','/qrcode.js':'clients/weapp/lib/qrcode.js','/':'index.html','/index.html':'index.html','/app.js':'app.js','/style.css':'style.css','/request-recovery.js':'clients/weapp/lib/recovery.js','/api-client.js':'api-client.js','/native-payment.js':'native-payment.js','/demo/':'demo/index.html','/demo/app.js':'demo/app.js','/demo/style.css':'demo/style.css'}
 PRODUCTS=[{'sku':'core','name':'核心产品买断','price_fen':12800,'description':'核心产品及核心更新，赠首个 30 天有限额 AI'}, {'sku':'ai30','name':'AI 30 天包','price_fen':2500,'description':'拟定：300 次成功问答，5 份周简报；正式开售前需成本验证'}]
 def integrations():return {'ai':bool(os.environ.get('AI_API_KEY') and os.environ.get('AI_BASE_URL') and os.environ.get('AI_MODEL')),'wechat':payments.configured('wechat'),'alipay':payments.configured('alipay'),'wechat_login':bool(os.environ.get('WX_APP_ID') and os.environ.get('WX_APP_SECRET')),'push':bool(push_notifications.configured()),'payment_mode':'configured' if payments.configured('wechat') or payments.configured('alipay') else 'not_configured','service_mode':os.environ.get('SERVICE_MODE','self_hosted'),'sales_enabled':os.environ.get('PAYMENTS_ENABLED')=='1'}
 
@@ -42,7 +42,7 @@ def ask_ai(user,fid,question,request_id,purpose='qa',binding=None):
    if prior['status']=='committed':
     if not prior.get('result') or prior['created_at']<=d.now()-ai_features.RETENTION_DAYS*86400:raise d.Problem(409,'历史回答已删除或超过保留期，请重新提问')
     result=prior['result']
-    if not d.citations_current(c,result):raise d.Problem(409,'参考内容已更新或撤回，请重新提问')
+    if not d.citations_current(c,result,fid,user):raise d.Problem(409,'参考内容已更新或撤回，请重新提问')
     return result
    if prior['status']=='reserved' and prior.get('reserved_until',prior['created_at']+120)>d.now():raise d.Problem(409,'该请求正在处理，请等待原请求完成')
   if c.execute('SELECT 1 FROM requests WHERE user_id=? AND key=?',(user,'ai:'+request_id)).fetchone():raise d.Problem(409,'旧请求无法核对原问题，请使用新的请求编号')
@@ -50,9 +50,9 @@ def ask_ai(user,fid,question,request_id,purpose='qa',binding=None):
   for stale in d.rows(c,'ai_usage',fid):
    if stale['status']=='reserved' and stale.get('reserved_until',stale['created_at']+120)<=d.now():
     stale['status']='released';d.put(c,'ai_usage',stale,fid)
-  knowledge=d.published_knowledge(c)
-  if not knowledge:return {'answer':'当前没有有效的已发布生活知识，暂不生成回答。你仍可管理家庭任务和预约。','kind':'knowledge','citations':[]}
-  words=[question[i:i+2] for i in range(max(0,len(question)-1))];ranked=sorted(knowledge,key=lambda k:sum(w in k['title']+k['body'] for w in words),reverse=True)[:3]
+  reading=knowledge.for_ai(c,fid,user)
+  if not reading:return {'answer':'当前没有有效的已发布生活知识，暂不生成回答。你仍可管理家庭任务和预约。','kind':'knowledge','citations':[]}
+  words=[question[i:i+2] for i in range(max(0,len(question)-1))];ranked=sorted(reading,key=lambda k:sum(w in k['title']+k['body'] for w in words),reverse=True)[:3]
   if not integrations()['ai']:
    return {'answer':'当前尚未配置 AI 服务。你可以先参考已发布的生活知识：\n\n'+'\n\n'.join(k['title']+'：'+k['body'] for k in ranked),'kind':'knowledge','citations':[{'id':k['id'],'title':k['title'],'version':k['content_version']} for k in ranked]}
   entitlement_id=None
@@ -82,7 +82,7 @@ def ask_ai(user,fid,question,request_id,purpose='qa',binding=None):
   result={'answer':answer,'kind':'ai','citations':[{'id':k['id'],'title':k['title'],'version':k['content_version']} for k in ranked]}
   with d.transaction() as c:
    d.member(c,fid,user,('dad',))
-   if not d.citations_current(c,result):raise d.Problem(409,'参考内容已更新或撤回，请重新提问')
+   if not d.citations_current(c,result,fid,user):raise d.Problem(409,'参考内容已更新或撤回，请重新提问')
    if binding:
     source=d.require_active(c,fid,'briefing',binding['id'])
     if binding.get('automatic') and not ai_features.preferences(c,fid,user)['auto_briefing']:raise d.Problem(409,'已关闭自动增强')
@@ -136,7 +136,7 @@ class Handler(BaseHTTPRequestHandler):
     p=ROOT/STATIC[path];ct='text/html; charset=utf-8' if p.suffix=='.html' else 'text/css; charset=utf-8' if p.suffix=='.css' else 'application/javascript; charset=utf-8';self.respond(p.read_bytes(),content_type=ct);return
    if path=='/api/public/template':self.respond(sharing.public_template());return
    if path=='/api/health':self.respond({'ok':True,'schema_version':1,'integrations':integrations()});return
-   if path not in ('/api/me','/api/state','/api/admin','/api/products','/api/export','/api/audit','/api/pregnancy/history','/api/calendar','/api/report','/api/task/knowledge','/api/briefings','/api/briefing','/api/notification-options','/api/account/security','/api/poster/code','/api/ai/history','/api/task-library'):raise d.Problem(404,'接口不存在')
+   if path not in ('/api/me','/api/state','/api/admin','/api/products','/api/export','/api/audit','/api/pregnancy/history','/api/calendar','/api/report','/api/task/knowledge','/api/briefings','/api/briefing','/api/notification-options','/api/account/security','/api/poster/code','/api/ai/history','/api/task-library','/api/knowledge','/api/ai/usage','/api/support','/api/admin/support','/api/admin/operations'):raise d.Problem(404,'接口不存在')
    if path=='/api/poster/code':
     with d.transaction() as c:
      s=self.identity(c);user=s['user_id']
@@ -150,6 +150,11 @@ class Handler(BaseHTTPRequestHandler):
     if path=='/api/me':result={'user':d.profile(c,user),'csrf':s['csrf'],'integrations':integrations()}
     elif path=='/api/state':result=d.snapshot(c,user,q.get('family_id',[''])[0]);result['integrations']=integrations()
     elif path=='/api/notification-options':result=push_notifications.options()
+    elif path=='/api/knowledge':result=knowledge.read(c,q.get('family_id',[''])[0],user,q.get('id',[''])[0])
+    elif path=='/api/ai/usage':result=ai_features.usage(c,q.get('family_id',[''])[0],user)
+    elif path=='/api/support':result=support.own(c,user)
+    elif path=='/api/admin/support':result=support.admin_list(c,user)
+    elif path=='/api/admin/operations':result=operations.overview(c,user)
     elif path=='/api/task-library':result=content_library.catalogue()
     elif path=='/api/ai/history':result=ai_features.history(c,q.get('family_id',[''])[0],user)
     elif path=='/api/account/security':result=accounts.settings(c,user)
@@ -165,6 +170,7 @@ class Handler(BaseHTTPRequestHandler):
     elif path=='/api/products':result={'products':PRODUCTS,'integrations':integrations()}
     elif path=='/api/export':
      fid=q.get('family_id',[''])[0];result=d.snapshot(c,user,fid);result.pop('consents',None)
+     result['support_tickets']=support.own(c,user)['tickets'];result['ai_history']=ai_features.history(c,fid,user)['items']
      result['pregnancy_events']=[e for e in d.rows(c,'pregnancy_event',fid) if d.can_health(c,fid,user,d.get(c,'pregnancy',e['pregnancy_id']))]
      result['baby_events']=[e for e in d.rows(c,'baby_event',fid) if lifecycle.can_read_babies(c,fid,user,d.get(c,'pregnancy',e['pregnancy_id']))]
      d.audit(c,fid,user,'data.export',{})
@@ -260,12 +266,17 @@ class Handler(BaseHTTPRequestHandler):
     with d.transaction() as c:result=d.preview_transition(c,user,d.text(data.get('family_id'),64),data.get('data',{}))
     self.respond(result);return
    with d.transaction() as c:
+    self.identity(c,True)
     if path=='/api/logout':c.execute('DELETE FROM sessions WHERE token_hash=?',(hashlib.sha256(self.token().encode()).hexdigest(),));result={'ok':True};cookie=self.cookie('',True)
     elif path=='/api/families':result=d.create_family(c,user,data)
     elif path=='/api/join':d.rate(c,'join:'+user,8,600);result=d.join(c,user,data.get('code'))
     elif path=='/api/action':
      fid=d.text(data.get('family_id'),64);action=d.text(data.get('action'),80);key=d.text(data.get('request_id'),80)
      result=d.command(c,user,fid,action,key,data.get('data',{}))
+    elif path=='/api/support':result=support.create(c,user,data)
+    elif path=='/api/support/withdraw':result=support.withdraw(c,user,data)
+    elif path=='/api/admin/support':result=support.reply(c,user,data)
+    elif path=='/api/admin/operations':result=operations.retry(c,user,data)
     elif path=='/api/knowledge':
      result=d.publish_knowledge(c,user,data)
     elif path=='/api/orders':

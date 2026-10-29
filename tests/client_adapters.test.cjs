@@ -363,3 +363,31 @@ test('WeChat backgrounding clears recovery code and password forms even without 
  const {page}=wechat(async()=>({statusCode:200,data:{}}));page.data.familyId='';page.data.modal='recovery-code';page.data.form={code:'private-code'};page.onHide();assert.equal(page.data.modal,'');assert.deepEqual(copy(page.data.form),{});
  page.data.modal='security';page.data.form={password:'private-password'};page.onHide();assert.deepEqual(copy(page.data.form),{});
 });
+
+test('WeChat reading opens the current authorized server version instead of cached knowledge',async()=>{
+ const {page,calls}=wechat(async options=>({statusCode:200,data:{knowledge:{id:'k',body:'当前正文',rights:'原创'}}}));page.data.state={knowledge:[{id:'k',body:'旧正文'}]};page.read({currentTarget:{dataset:{id:'k'}}});await settled(page);assert.equal(page.data.knowledge.body,'当前正文');assert.ok(calls[0].path.endsWith('/knowledge?family_id=family&id=k'));
+});
+
+test('WeChat revoked reading clears old body and private support disappears after sign-out',async()=>{
+ const {page,app}=wechat(async options=>options.url.includes('/knowledge?')?{statusCode:409,data:{error:'范围变化'}}:{statusCode:200,data:snapshot()});page.data.knowledge={body:'旧正文'};page.read({currentTarget:{dataset:{id:'k'}}});await settled(page);assert.equal(page.data.modal,'');assert.equal(page.data.knowledge,null);
+ page.data.tickets=[{body:'私人反馈',reply:'私人回复'}];page.data.usageSummary={private:'old'};app.clearSession();assert.deepEqual(copy(page.data.tickets),[]);assert.equal(page.data.usageSummary,null);
+});
+
+test('WeChat support preserves the original request after a lost response without attaching family data',async()=>{
+ let received=0;const {page,calls}=wechat(async options=>{if(options.url.endsWith('/support')&&options.method==='POST'){received++;if(received===1)throw Error('saved response lost');return {statusCode:200,data:{id:'ticket'}}}return {statusCode:200,data:{tickets:[]}}});
+ page.newSupport({currentTarget:{dataset:{category:'ai'}}});Object.assign(page.data.form,{title:'回答问题',body:'本人手动描述',confirmed:true});const id=page.data.form.request_id;
+ page.submitSupport();await settled(page);assert.equal(page.data.form.request_id,id);page.submitSupport();await settled(page);const sent=calls.filter(c=>c.path.endsWith('/support')&&c.data);assert.equal(sent.length,2);assert.equal(sent[0].data.request_id,sent[1].data.request_id);assert.equal(Object.hasOwn(sent[0].data,'family_id'),false);assert.equal(sent[0].data.category,'ai');
+});
+
+test('WeChat usage is family-scoped and a reading preference changes through a typed household command',async()=>{
+ const {page,calls}=wechat(async options=>({statusCode:200,data:options.url.includes('/ai/usage?')?{cycles:[],daily:{used:0,limit:30}}:options.url.endsWith('/action')?{ok:true}:snapshot()}));page.usage();await settled(page);assert.ok(calls[0].path.endsWith('/ai/usage?family_id=family'));
+ page.data.form={region:' CN-SH '};page.saveReadingPreferences();await settled(page);const sent=calls.find(c=>c.path.endsWith('/action'));assert.equal(sent.data.action,'knowledge.preferences');assert.deepEqual(sent.data.data,{region:'CN-SH'});
+});
+
+test('WeChat foreground rechecks account-only support when no family is selected',async()=>{
+ const {page,app}=wechat(async()=>({statusCode:401,data:{error:'expired'}}));page._shown=true;page.data.familyId='';page.data.modal='support';page.data.tickets=[{body:'old-private-ticket'}];page.onShow();await settled(page);assert.equal(page.data.auth,false);assert.equal(app.globalData.token,'');assert.deepEqual(copy(page.data.tickets),[]);assert.equal(page.data.modal,'');
+});
+
+test('WeChat task and item AI entries prefill generic questions without copying private titles or notes',()=>{
+ const {page,calls}=wechat(async()=>({statusCode:200,data:{}}));page.data.role='dad';page.data.taskDetail={title:'private-health-title'};page.data.form={note:'private-item-note'};page.contextAi({currentTarget:{dataset:{kind:'task'}}});assert.equal(page.data.modal,'ai');assert.equal(JSON.stringify(page.data.form).includes('private'),false);assert.match(page.data.form.question,/步骤/);page.contextAi({currentTarget:{dataset:{kind:'item'}}});assert.match(page.data.form.question,/预算/);assert.equal(calls.length,0);
+});

@@ -5,6 +5,27 @@ import unicodedata
 RETENTION_DAYS=180
 
 
+def usage(c,fid,user):
+    import os,domain as d
+    d.member(c,fid,user);rows=d.rows(c,'ai_usage',fid)
+    active=lambda r:r['status']=='committed' or (r['status']=='reserved' and r.get('reserved_until',r['created_at']+120)>d.now())
+    mine=[r for r in rows if r['user_id']==user];daily=[r for r in mine if r['created_at']>d.now()-86400 and active(r)]
+    cycles=[]
+    for grant in d.rows(c,'entitlement',fid):
+        if grant['benefit'] not in ('ai','ai_gift') or (grant.get('owner')!=user and grant.get('bound_family')!=fid):continue
+        counts={}
+        for purpose,quota in (('qa',grant.get('quota',300)),('briefing',grant.get('briefing_quota',5))):
+            successful=sum(r.get('entitlement_id')==grant['id'] and r.get('purpose','qa')==purpose and r['status']=='committed' for r in rows)
+            pending=sum(r.get('entitlement_id')==grant['id'] and r.get('purpose','qa')==purpose and r['status']=='reserved' and active(r) for r in rows)
+            counts[purpose]={'quota':quota,'successful':successful,'reserved':pending,'remaining':max(0,quota-successful-pending)}
+        state=grant['status']
+        if state=='active':state='scheduled' if (grant.get('starts_at') or 0)>d.now() else 'expired' if (grant.get('ends_at') or 0)<=d.now() else 'active'
+        cycles.append({'state':state,'can_activate':grant.get('owner')==user and grant['benefit']=='ai_gift' and grant['status']=='unactivated','id':grant['id'],'benefit':grant['benefit'],'status':grant['status'],'starts_at':grant.get('starts_at'),'ends_at':grant.get('ends_at'),'counts':counts})
+    return {'mode':os.environ.get('SERVICE_MODE','self_hosted'),'daily':{'limit':int(os.environ.get('AI_DAILY_LIMIT','30')),'used':len(daily)},
+            'my_successful':sum(r['status']=='committed' for r in mine),'my_reserved':sum(r['status']=='reserved' and active(r) for r in mine),'cycles':cycles,
+            'notice':'成功次数与处理中占额分别计算，失败不计成功次数，删除历史不会返还额度。周期数为家庭共享额度，不包含他人的问题或回答。'}
+
+
 def unsafe_question(question):
     text=unicodedata.normalize('NFKC',question).lower()
     # Conservative static routing, not a claim of clinical assessment or professional review.
@@ -24,7 +45,7 @@ def history(c,fid,user):
     for row in d.rows(c,'ai_usage',fid):
         if row['user_id']!=user or row['status']!='committed' or row.get('purpose','qa')!='qa' or row['created_at']<=d.now()-RETENTION_DAYS*86400:continue
         if not row.get('question') or not row.get('result'):continue
-        valid=d.citations_current(c,row['result'])
+        valid=d.citations_current(c,row['result'],fid,user)
         items.append({'id':row['id'],'question':row['question'],'created_at':row['created_at'],
                       'result':row['result'] if valid else None,'status':'available' if valid else 'source_changed'})
     return {'items':sorted(items,key=lambda r:(r['created_at'],r['id']),reverse=True)[:100],'retention_days':RETENTION_DAYS}
@@ -59,7 +80,7 @@ def enhanced(c,fid,user,id):
     row=d.require_active(c,fid,'briefing',id)
     if not briefings.authorized(c,fid,user,row):return None
     for usage in d.rows(c,'ai_usage',fid):
-        if usage['user_id']==user and usage.get('purpose')=='briefing' and usage.get('briefing_id')==id and usage.get('briefing_revision')==row['revision'] and usage['status']=='committed' and usage.get('result') and usage['created_at']>d.now()-RETENTION_DAYS*86400 and d.citations_current(c,usage['result']):return usage['result']
+        if usage['user_id']==user and usage.get('purpose')=='briefing' and usage.get('briefing_id')==id and usage.get('briefing_revision')==row['revision'] and usage['status']=='committed' and usage.get('result') and usage['created_at']>d.now()-RETENTION_DAYS*86400 and d.citations_current(c,usage['result'],fid,user):return usage['result']
     return None
 
 

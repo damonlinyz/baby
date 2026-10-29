@@ -1,6 +1,19 @@
 const app=getApp(),Poster=require('../../lib/poster');
 const confirmation=(title,content)=>new Promise(resolve=>wx.showModal({title,content,success:r=>resolve(r.confirm),fail:()=>resolve(false)}));
 module.exports={
+ contextAi(e){if(this.data.role!=='dad'){wx.showToast({title:'仅统筹者可使用 AI 问答',icon:'none'});return}this.setData({modal:'ai',aiText:'',form:{question:e.currentTarget.dataset.kind==='item'?'整理生活用品时，怎样先盘点再按预算准备，避免重复采购？':'如何把一项家庭小事分成清晰步骤，并与家人约定分工？'}})},
+ accountHomeRefresh(){this.run(async()=>{this.close();const r=await app.request('/me');this.setData({user:r.user})})},
+ readingPreferences(){this.setData({modal:'reading-preferences',form:{region:this.data.state.knowledge_preferences.region==='all'?'':this.data.state.knowledge_preferences.region}})},
+ saveReadingPreferences(){this.run(async()=>{await this.action('knowledge.preferences',{region:this.data.form.region?.trim()||''});this.close()})},
+ usage(){this.run(async()=>{this.setData({modal:'usage',usageSummary:null});const r=await app.request('/ai/usage?family_id='+encodeURIComponent(this.data.familyId));this.setData({usageSummary:r})})},
+ activateGift(){this.run(async()=>{if(!await confirmation('启用赠送的 30 天 AI','周期从现在开始计算。基础功能不因 AI 到期而关闭。'))return;await this.action('ai.activate_gift',{});const r=await app.request('/ai/usage?family_id='+encodeURIComponent(this.data.familyId));this.setData({usageSummary:r})})},
+ support(){this.run(async()=>{this.setData({modal:'support',tickets:[],form:{}});const r=await app.request('/support');this.setData({tickets:r.tickets})})},
+ newSupport(e){this.setData({modal:'support-new',form:{category:e?.currentTarget?.dataset?.category==='ai'?3:0,request_id:Date.now()+'-'+Math.random().toString(36).slice(2)}})},
+ supportConfirm(e){this.setData({'form.confirmed':e.detail.value.includes('yes')})},
+ submitSupport(){this.run(async()=>{const f=this.data.form;await app.request('/support',{category:['usage','account','content','ai','other'][f.category||0],title:f.title,body:f.body,request_id:f.request_id,confirmed:f.confirmed===true});const r=await app.request('/support');this.setData({modal:'support',tickets:r.tickets,form:{}})})},
+ withdrawSupport(e){this.run(async()=>{const row=this.data.tickets.find(r=>r.id===e.currentTarget.dataset.id);if(!await confirmation('撤回问题','清除本人问题和管理员回复正文？'))return;await app.request('/support/withdraw',{id:row.id,version:row.version});const r=await app.request('/support');this.setData({tickets:r.tickets})})},
+ copySource(){if(this.data.knowledge?.source_url)wx.setClipboardData({data:this.data.knowledge.source_url})},
+
  onHide(){if(['security','recovery-code','account-recover'].includes(this.data.modal))this.close()},
  onUnload(){this.cleanPoster()},
  taskLibrary(){this.run(async()=>{const r=await app.request('/task-library');this.setData({modal:'task-library',libraryGroups:[...new Set(r.templates.map(t=>t.group))].map(group=>({group,templates:r.templates.filter(t=>t.group===group)})),form:{}})})},

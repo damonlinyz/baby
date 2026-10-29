@@ -1,6 +1,6 @@
 """SQLite domain layer. Mutations run under BEGIN IMMEDIATE; callers supply authenticated actor."""
 import os,json,sqlite3,secrets,hashlib,hmac,time,datetime,contextlib
-import templates,dates,lifecycle,recurring,bag,reports,task_details,engagement,reminders,briefings,sharing,push_notifications,social,ai_features,content_library
+import templates,dates,lifecycle,recurring,bag,reports,task_details,engagement,reminders,briefings,sharing,push_notifications,social,ai_features,content_library,knowledge,support
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent.parent
 DB=Path(os.environ.get('BABA_DB',str(ROOT/'private'/'baba.sqlite3')))
@@ -256,7 +256,7 @@ def erase_account(c,user):
    removed.add(t['id']);c.execute("DELETE FROM records WHERE kind='task' AND id=?",(t['id'],))
   else:
    t['pregnancy_id']=None;t['stage']=None;put(c,'task',t,row['family_id'])
- for kind in ('pregnancy','pregnancy_event','baby_event','outbox','appointment','baby','chat','consent','wechat_identity','notification_preferences','engagement_preferences','subscription','external_delivery','completion_fact','checkin','support_fact','ai_usage','transfer','account_recovery','feedback','ai_preferences'):
+ for kind in ('pregnancy','pregnancy_event','baby_event','outbox','appointment','baby','chat','consent','wechat_identity','notification_preferences','engagement_preferences','subscription','external_delivery','completion_fact','checkin','support_fact','ai_usage','transfer','account_recovery','feedback','ai_preferences','knowledge_preferences','support_ticket','admin_receipt'):
   for obj in rows(c,kind):
    if obj.get('pregnancy_id') in owned or obj['id'] in owned or any(obj.get(k)==user for k in ('subject_id','owner','subject','grantee','user_id','from','to')):
     removed.add(obj['id']);c.execute('DELETE FROM records WHERE kind=? AND id=?',(kind,obj['id']))
@@ -303,12 +303,14 @@ def snapshot(c,user,fid):
  for a in rows(c,'appointment',fid):
   ap=get(c,'pregnancy',a['pregnancy_id']) if a.get('pregnancy_id') else None
   if can_health(c,fid,user,ap) or (not ap and a['owner']==user):appointments.append(a)
- knowledge=published_knowledge(c)
- tasks=[task_details.decorate(t,knowledge) for t in tasks]
+ reading=knowledge.for_reader(c,fid,user,p)
+ tasks=[task_details.decorate(t,reading) for t in tasks]
  orders=[o for o in rows(c,'order',fid) if o['payer']==user]
  order_ids={o['id'] for o in orders}
  refunds=[r for r in rows(c,'refund',fid) if r['order_id'] in order_ids]
- result={'calendar_date':str(today(f.get('timezone',dates.DEFAULT_TIMEZONE))),'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'task_series':[task_details.decorate(s,knowledge) for s in rows(c,'task_series',fid) if me['role']!='member' or s['assignee']==user],'items':items,'deleted_items':[i for i in all_items if i.get('deleted')] if me['role']=='dad' else [],'pregnancy':p,'babies':babies,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and can_view_notification(c,fid,user,n)], 'reminder_preferences':reminders.preferences(c,fid,user), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'refunds':refunds,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
+ result={'calendar_date':str(today(f.get('timezone',dates.DEFAULT_TIMEZONE))),'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'task_series':[task_details.decorate(s,reading) for s in rows(c,'task_series',fid) if me['role']!='member' or s['assignee']==user],'items':items,'deleted_items':[i for i in all_items if i.get('deleted')] if me['role']=='dad' else [],'pregnancy':p,'babies':babies,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':reading,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and can_view_notification(c,fid,user,n)], 'reminder_preferences':reminders.preferences(c,fid,user), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'refunds':refunds,'entitlements':[e for e in rows(c,'entitlement',fid) if e.get('owner')==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
+ result['knowledge_preferences']={'region':knowledge.preference(c,fid,user)['region']}
+ result['ai_usage_summary']=ai_features.usage(c,fid,user)
  result['ai_preferences']={'auto_briefing':ai_features.preferences(c,fid,user)['auto_briefing']}
  result['feedback_feed']=social.feed(c,fid,user,result)
  result['weekly_report']=reports.build(result)
@@ -509,6 +511,7 @@ def transition(c,fid,user,p,data):
 
 def mutate(c,user,fid,action,data):
  me=member(c,fid,user);role=me['role'];f=get(c,'family',fid)
+ if action=='knowledge.preferences':return knowledge.save(c,fid,user,data)
  if action=='task.from_library':return content_library.create(c,fid,user,data)
  if action=='ai.briefing_preferences':return ai_features.save(c,fid,user,data)
  if action=='ai_history.delete':return ai_features.delete_history(c,fid,user,data)
@@ -707,12 +710,17 @@ def join(c,user,code):
 
 def seed_knowledge(c):
  for i,(topic,title,body) in enumerate(KNOWLEDGE):
-  if not c.execute("SELECT 1 FROM records WHERE kind='knowledge' AND id=?",('base-'+str(i),)).fetchone():put(c,'knowledge',{'id':'base-'+str(i),'topic':topic,'title':title,'body':body,'status':'published','clinical':False,'source':'产品编辑 · 一般家庭生活内容','source_url':None,'content_version':1,'reviewer':'初始生活内容','published_at':now(),'valid_until':None})
+  if not c.execute("SELECT 1 FROM records WHERE kind='knowledge' AND id=?",('base-'+str(i),)).fetchone():put(c,'knowledge',{'id':'base-'+str(i),'topic':topic,'title':title,'body':body,'status':'published','clinical':False,'source':'产品编辑 · 一般家庭生活内容','source_url':None,'rights':'产品原创一般生活内容，可在本应用阅读与引用','applicability':'一般家庭生活整理，不用于诊疗判断','content_version':1,'reviewer':'初始生活内容','published_at':now(),'valid_until':None})
 
 def published_knowledge(c):
  result=[]
  for k in rows(c,'knowledge'):
   if k.get('status')!='published' or k.get('clinical'):continue
+  start=k.get('valid_from')
+  if start:
+   try:
+    if date(start)>today():continue
+   except Problem:continue
   until=k.get('valid_until')
   if until:
    try:
@@ -721,8 +729,8 @@ def published_knowledge(c):
   result.append(k)
  return result
 
-def citations_current(c,result):
- current={k['id']:k['content_version'] for k in published_knowledge(c)}
+def citations_current(c,result,fid=None,user=None):
+ current={k['id']:k['content_version'] for k in (knowledge.available(c,fid,user) if fid and user else published_knowledge(c))}
  return all(current.get(ref['id'])==ref['version'] for ref in result.get('citations',[]))
 
 def publish_knowledge(c,user,data):
@@ -736,7 +744,9 @@ def publish_knowledge(c,user,data):
  if until:
   until=str(date(until))
   if status=='published' and date(until)<today():raise Problem(400,'不能发布已过有效期的知识')
- k={'id':id,'title':text(data.get('title'),100),'body':text(data.get('body'),20000),'topic':text(data.get('topic'),40),'clinical':False,'source':text(data.get('source'),300),'content_version':old['content_version']+1 if old else 1,'status':status,'reviewer':user,'published_at':now() if status=='published' else None,'valid_until':until}
+ meta=knowledge.metadata(data,old)
+ if until and meta['valid_from'] and date(meta['valid_from'])>date(until):raise Problem(400,'内容生效日期不能晚于到期日期')
+ k={'id':id,'title':text(data.get('title'),100),'body':text(data.get('body'),20000),'topic':text(data.get('topic'),40),'clinical':False,'source':text(data.get('source'),300),'content_version':old['content_version']+1 if old else 1,'status':status,'reviewer':user,'published_at':now() if status=='published' else None,'valid_until':until,**meta,'reviewed_at':now() if status=='published' else None,'reviewer_label':profile(c,user)['name']}
  put(c,'knowledge_version',dict(k,id=id+'-v'+str(k['content_version']),knowledge_id=id))
  put(c,'knowledge',k);audit(c,None,user,'knowledge.'+status,{'id':id,'content_version':k['content_version']})
  return {'id':id}
@@ -746,6 +756,6 @@ def tick():
   for f in rows(c,'family'):
    fid=f['id'];expire_approvals(c,fid);recurring.sync(c,fid);process_outbox(c,fid)
    reminders.schedule(c,fid);briefings.schedule(c,fid);reminders.deliver(c,fid);sharing.expire(c,fid);social.clean(c,fid)
- with transaction() as c:ai_features.clean(c)
+ with transaction() as c:ai_features.clean(c);support.clean(c)
  push_notifications.dispatch()
  ai_features.dispatch()
