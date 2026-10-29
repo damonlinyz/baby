@@ -143,3 +143,17 @@ class HttpTests(unittest.TestCase):
   _,state=self.req('/api/state?family_id='+fid,token=token);self.assertEqual(state['weekly_report'],report)
   self.assertEqual(self.req(path+'&week=bad',token=token)[0],400);self.assertEqual(self.req(path+'&week=9999-12-31',token=token)[0],400)
   self.req('/api/logout',{},token,csrf);self.assertEqual(self.req(path,token=token)[0],401)
+
+ def test_task_reference_route_rechecks_assignment_and_current_links(self):
+  dad=self.account('http-detail-dad');member=self.account('http-detail-member');token,csrf=dad['session_token'],dad['csrf'];mt,mc=member['session_token'],member['csrf']
+  _,family=self.req('/api/families',{'name':'任务知识验证'},token,csrf);fid=family['family_id']
+  def action(name,data,key):
+   status,result=self.req('/api/action',{'family_id':fid,'action':name,'data':data,'request_id':key},token,csrf);self.assertEqual(status,200,result);return result
+  invitation=action('invite.create',{'role':'member'},'detail-invite');self.assertEqual(self.req('/api/join',{'code':invitation['invite_code']},mt,mc)[0],200)
+  t=action('task.create',{'title':'任务引用','steps':['盘点'],'knowledge_ids':['base-1'],'assignee':member['user']['id']},'detail-task')
+  path='/api/task/knowledge?family_id='+fid+'&task_id='+t['id']+'&knowledge_id=base-1'
+  self.assertEqual(self.req(path)[0],401);self.assertEqual(self.req(path,token=mt)[0],200)
+  _,state=self.req('/api/state?family_id='+fid,token=token);task=next(task for task in state['tasks'] if task['id']==t['id'])
+  action('task.update',{'id':task['id'],'version':task['version'],'assignee':dad['user']['id']},'detail-reassign')
+  self.assertEqual(self.req(path,token=mt)[0],403);self.assertEqual(self.req(path+'&unused=value',token=token)[0],200)
+  self.assertEqual(self.req(path.replace('knowledge_id=base-1','knowledge_id=base-0'),token=token)[0],409)

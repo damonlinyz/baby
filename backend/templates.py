@@ -23,7 +23,7 @@ TEMPLATES=[
  ('growth-archive','postpartum',180,'整理半年里想保存的小事','照片和记录需尊重家人意愿','陪伴'),
  ('birthday-plan','postpartum',350,'一起计划简简单单的周岁纪念','回顾陪伴与成长，不必攀比','陪伴')]
 def sync(c,fid,p):
- import domain as d,datetime,hashlib,lifecycle
+ import domain as d,datetime,hashlib,lifecycle,task_details
  if p.get('archived') or p['state'] in ('dating','ended'):return
  anchor=d.date(p['edd'] if p['state']=='pregnant' else p['birth_date'])
  coordinator=d.get(c,'family',fid)['coordinator']
@@ -42,4 +42,4 @@ def sync(c,fid,p):
     if t['status']=='pending':t['status']='in_progress'
     t['due_date']=str(due);t['anchor_revision']=p['revision'];d.put(c,'task',t,fid)
   elif due>=d.today(d.get(c,'family',fid).get('timezone','Asia/Shanghai'))-datetime.timedelta(days=7):
-   d.put(c,'task',{'id':id,'template_key':key,'template_version':1,'pregnancy_id':p['id'],'stage':stage,'title':title,'note':note,'type':category,'assignee':coordinator,'status':'todo','due_date':str(due),'anchor_revision':p['revision'],'private_health_anchor':True,'user_override':False,'created_at':d.now()},fid)
+   d.put(c,'task',{'id':id,**task_details.template_content(c,category),'template_key':key,'template_version':2,'pregnancy_id':p['id'],'stage':stage,'title':title,'note':note,'type':category,'assignee':coordinator,'status':'todo','due_date':str(due),'anchor_revision':p['revision'],'private_health_anchor':True,'user_override':False,'created_at':d.now()},fid)

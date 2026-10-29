@@ -4,7 +4,7 @@ import os,sys,json,time,hashlib,secrets,threading,urllib.parse,urllib.request,sq
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 from pathlib import Path
 import domain as d
-import payments,lifecycle,calendar_export,reports
+import payments,lifecycle,calendar_export,reports,task_details
 ROOT=Path(__file__).resolve().parent.parent
 PORT=int(os.environ.get('PORT','8766'));HOST=os.environ.get('HOST','127.0.0.1')
 PUBLIC_ORIGIN=os.environ.get('PUBLIC_ORIGIN',f'http://127.0.0.1:{PORT}')
@@ -125,11 +125,12 @@ class Handler(BaseHTTPRequestHandler):
    if path in STATIC:
     p=ROOT/STATIC[path];ct='text/html; charset=utf-8' if p.suffix=='.html' else 'text/css; charset=utf-8' if p.suffix=='.css' else 'application/javascript; charset=utf-8';self.respond(p.read_bytes(),content_type=ct);return
    if path=='/api/health':self.respond({'ok':True,'schema_version':1,'integrations':integrations()});return
-   if path not in ('/api/me','/api/state','/api/admin','/api/products','/api/export','/api/audit','/api/pregnancy/history','/api/calendar','/api/report'):raise d.Problem(404,'接口不存在')
+   if path not in ('/api/me','/api/state','/api/admin','/api/products','/api/export','/api/audit','/api/pregnancy/history','/api/calendar','/api/report','/api/task/knowledge'):raise d.Problem(404,'接口不存在')
    with d.transaction() as c:
     s=self.identity(c);user=s['user_id']
     if path=='/api/me':result={'user':d.profile(c,user),'csrf':s['csrf'],'integrations':integrations()}
     elif path=='/api/state':result=d.snapshot(c,user,q.get('family_id',[''])[0]);result['integrations']=integrations()
+    elif path=='/api/task/knowledge':result=task_details.read_knowledge(c,q.get('family_id',[''])[0],user,q.get('task_id',[''])[0],q.get('knowledge_id',[''])[0])
     elif path=='/api/report':result=reports.build(d.snapshot(c,user,q.get('family_id',[''])[0]),q.get('week',[None])[0])
     elif path=='/api/calendar':result=calendar_export.export(c,user,q.get('family_id',[''])[0],q.get('start',[None])[0],q.get('end',[None])[0])
     elif path=='/api/pregnancy/history':result={'events':d.pregnancy_history(c,user,q.get('family_id',[''])[0],q.get('pregnancy_id',[''])[0])}

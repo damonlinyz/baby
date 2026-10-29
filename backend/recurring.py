@@ -28,6 +28,8 @@ def create(c, fid, user, data):
               'assignee': assignee, 'frequency': frequency, 'every': every,
               'start_date': str(start), 'until_date': str(until) if until else None,
               'status': 'active', 'rule_revision': 1, 'created_by': user, 'created_at': d.now()}
+    import task_details
+    series.update(task_details.validate(c, data, defaults=True))
     d.put(c, 'task_series', series, fid)
     created = generate(c, fid, series)
     if assignee != user:
@@ -108,6 +110,7 @@ def generate(c, fid, series):
                              'type': '重复家务', 'assignee': series['assignee'], 'status': 'todo',
                              'due_date': str(scheduled), 'series_id': series['id'], 'series_date': str(scheduled),
                              'series_revision': series.get('rule_revision', 1),
+                             'steps': list(series.get('steps', [])), 'knowledge_ids': list(series.get('knowledge_ids', [])),
                              'pregnancy_id': None, 'stage': None, 'private_health_anchor': False,
                              'created_at': d.now()}, fid)
             created += 1
@@ -121,7 +124,7 @@ def sync(c, fid):
         generate(c, fid, series)
 
 
-CONFIG = ('title', 'note', 'assignee', 'frequency', 'every', 'start_date', 'until_date')
+CONFIG = ('title', 'note', 'assignee', 'frequency', 'every', 'start_date', 'until_date', 'steps', 'knowledge_ids')
 
 
 def lock_task(c, fid, task, reason):
@@ -173,6 +176,8 @@ def update(c, fid, series, actor, data):
     new = dict(series, title=d.text(data.get('title', series['title']), 100), note=note,
                assignee=assignee, frequency=frequency, every=every,
                start_date=str(start), until_date=str(until) if until else None)
+    import task_details
+    new.update(task_details.validate(c, data))
     result = {'id': series['id'], 'updated_occurrences': 0, 'cancelled_occurrences': 0,
               'created_occurrences': 0, 'preserved_occurrences': 0}
     if all(new.get(key) == series.get(key) for key in CONFIG):
@@ -190,7 +195,7 @@ def update(c, fid, series, actor, data):
         rule_cancelled = task.get('series_locked') == 'rule_changed'
         original_status = task.get('series_resume_status') if paused else task['status']
         overridden = task.get('user_override') or task.get('series_override') or (
-            not rule_cancelled and any(task.get(key) != series[key] for key in ('title', 'note', 'assignee')))
+            not rule_cancelled and any(task.get(key, [] if key in ('steps','knowledge_ids') else None) != series.get(key, [] if key in ('steps','knowledge_ids') else None) for key in ('title', 'note', 'assignee','steps','knowledge_ids')))
         eligible = (original_status == 'todo' or rule_cancelled) and not overridden and not task.get('series_stopped')
         eligible = eligible and d.date(task['series_date']) >= current and task.get('due_date') and d.date(task['due_date']) >= current
         if not eligible:
@@ -203,6 +208,7 @@ def update(c, fid, series, actor, data):
             continue
         # Reuse the stable original-date ID; completed/manual-cancelled slots never reappear.
         d.reset_reminder(c, fid, task)
+        task.update(steps=list(new.get('steps', [])), knowledge_ids=list(new.get('knowledge_ids', [])))
         task.update(title=new['title'], note=new['note'], assignee=new['assignee'],
                     series_revision=new['rule_revision'])
         if new['status'] == 'paused':

@@ -253,3 +253,21 @@ test('WeChat paused or superseded occurrence cannot be completed directly',async
  const {page,calls,toasts}=wechat(async()=>{throw Error('unexpected request')});page.data.state={...snapshot(),tasks:[{id:'task',version:3,assignee:'mom',status:'cancelled',series_locked:'paused'}]};
  page.completeTask({currentTarget:{dataset:{id:'task'}}});await settled(page);assert.equal(calls.length,0);assert.match(toasts.at(-1).title,/暂停或关闭/);
 });
+
+test('WeChat task detail saves normalized steps and selected knowledge with the opening version',async()=>{
+ const {page,calls}=wechat(async o=>({statusCode:200,data:o.url.endsWith('/action')?{id:'task'}:snapshot()}));
+ page.data.role='dad';page.data.state={...snapshot(),knowledge:[{id:'k',title:'生活知识'}],tasks:[{id:'task',version:5,title:'整理',note:'原说明',assignee:'mom',steps:['原步骤'],knowledge_ids:['k'],linked_knowledge:[]}]};
+ page.openTask({currentTarget:{dataset:{id:'task'}}});page.field({currentTarget:{dataset:{key:'steps_text'}},detail:{value:'  先沟通  \n\n再分工'}});page.chooseTaskKnowledge({detail:{value:['k']}});page.addTask();await settled(page);
+ const c=calls.find(c=>c.path.endsWith('/action')).data;assert.equal(c.action,'task.update');assert.equal(c.data.version,5);assert.deepEqual(c.data.steps,['先沟通','再分工']);assert.deepEqual(c.data.knowledge_ids,['k']);assert.equal(page.data.taskDetail,null);
+});
+
+test('WeChat linked knowledge is fetched through the task-scoped endpoint before reading',async()=>{
+ const {page,calls}=wechat(async()=>({statusCode:200,data:{knowledge:{id:'k',title:'最新生活知识',body:'当前版本'}}}));
+ page.data.taskDetail={id:'task'};page.readTaskKnowledge({currentTarget:{dataset:{id:'k'}}});await settled(page);
+ assert.match(calls[0].path,/\/task\/knowledge\?family_id=family&task_id=task&knowledge_id=k$/);assert.equal(page.data.modal,'read');assert.equal(page.data.knowledge.title,'最新生活知识');
+});
+
+test('WeChat readonly task exposes steps without enabling editing and foreground clears the draft',async()=>{
+ const {page}=wechat(async()=>({statusCode:200,data:snapshot()}));page.data.role='mom';page.data.state={...snapshot(),tasks:[{id:'task',version:1,title:'只读任务',note:'说明',assignee:'mom',steps:['第一步'],knowledge_ids:[]}]};
+ page.openTask({currentTarget:{dataset:{id:'task'}}});assert.equal(page.data.taskReadOnly,true);assert.equal(page.data.taskDetail.stepRows[0].text,'第一步');page._shown=true;page.onShow();await settled(page);assert.equal(page.data.taskDetail,null);assert.equal(page.data.modal,'');
+});

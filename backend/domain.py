@@ -1,6 +1,6 @@
 """SQLite domain layer. Mutations run under BEGIN IMMEDIATE; callers supply authenticated actor."""
 import os,json,sqlite3,secrets,hashlib,hmac,time,datetime,contextlib
-import templates,dates,lifecycle,recurring,bag,reports
+import templates,dates,lifecycle,recurring,bag,reports,task_details
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent.parent
 DB=Path(os.environ.get('BABA_DB',str(ROOT/'private'/'baba.sqlite3')))
@@ -106,7 +106,7 @@ def create_family(c,user,data):
  if len(profile(c,user)['families'])>=10:raise Problem(400,'已达到家庭数量上限')
  fid=uid();f={'id':fid,'name':text(data.get('name'),40),'coordinator':user,'mode':'off','policy_version':1,'created_at':now(),'active_pregnancy_id':None,'timezone':dates.DEFAULT_TIMEZONE}
  put(c,'family',f,fid);c.execute('INSERT INTO memberships VALUES(?,?,?,1)',(fid,user,'dad'))
- for title,note,type in TASKS:put(c,'task',{'id':uid(),'title':title,'note':note,'type':type,'assignee':user,'status':'todo','due_date':None,'completed_at':None,'created_at':now()},fid)
+ for title,note,type in TASKS:put(c,'task',{'id':uid(),'title':title,'note':note,'type':type,'assignee':user,'status':'todo','due_date':None,'completed_at':None,'created_at':now(),**task_details.template_content(c,{'准备事项':'物品准备','陪伴':'陪伴','协作':'家庭协作'}[type]),'template_version':2},fid)
  for name,pack,note in ITEMS:put(c,'item',{'id':uid(),'name':name,'pack':pack,'note':note,'quantity':1,'assignee':user,'status':'todo','level':'建议'},fid)
  audit(c,fid,user,'family.created',{});return {'family_id':fid}
 def can_health(c,f,user,p=None):
@@ -280,10 +280,11 @@ def snapshot(c,user,fid):
   ap=get(c,'pregnancy',a['pregnancy_id']) if a.get('pregnancy_id') else None
   if can_health(c,fid,user,ap) or (not ap and a['owner']==user):appointments.append(a)
  knowledge=published_knowledge(c)
+ tasks=[task_details.decorate(t,knowledge) for t in tasks]
  orders=[o for o in rows(c,'order',fid) if o['payer']==user]
  order_ids={o['id'] for o in orders}
  refunds=[r for r in rows(c,'refund',fid) if r['order_id'] in order_ids]
- result={'calendar_date':str(today(f.get('timezone',dates.DEFAULT_TIMEZONE))),'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'task_series':[s for s in rows(c,'task_series',fid) if me['role']!='member' or s['assignee']==user],'items':items,'deleted_items':[i for i in all_items if i.get('deleted')] if me['role']=='dad' else [],'pregnancy':p,'babies':babies,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and can_view_notification(c,fid,user,n)], 'reminder_preferences':next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==user),{'enabled':True}), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'refunds':refunds,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
+ result={'calendar_date':str(today(f.get('timezone',dates.DEFAULT_TIMEZONE))),'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'task_series':[task_details.decorate(s,knowledge) for s in rows(c,'task_series',fid) if me['role']!='member' or s['assignee']==user],'items':items,'deleted_items':[i for i in all_items if i.get('deleted')] if me['role']=='dad' else [],'pregnancy':p,'babies':babies,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and can_view_notification(c,fid,user,n)], 'reminder_preferences':next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==user),{'enabled':True}), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'refunds':refunds,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
  result['weekly_report']=reports.build(result)
  return result
 def propose(c,fid,user,resource,action,payload,target=None):
@@ -559,7 +560,7 @@ def mutate(c,user,fid,action,data):
    assignee=data.get('assignee') or user;member(c,fid,assignee)
    due=data.get('due_date') or None
    if due:date(due)
-   if action=='task.create':obj={'id':uid(),'title':text(data.get('title'),100),'note':str(data.get('note',''))[:500],'type':data.get('type','自定义'),'assignee':assignee,'status':'todo','due_date':due,'created_at':now(),'pregnancy_id':f.get('active_pregnancy_id'),'stage':get(c,'pregnancy',f['active_pregnancy_id'])['state'] if f.get('active_pregnancy_id') else None};put(c,'task',obj,fid)
+   if action=='task.create':obj={'id':uid(),'title':text(data.get('title'),100),'note':str(data.get('note',''))[:500],'type':data.get('type','自定义'),'assignee':assignee,'status':'todo','due_date':due,'created_at':now(),'pregnancy_id':f.get('active_pregnancy_id'),'stage':get(c,'pregnancy',f['active_pregnancy_id'])['state'] if f.get('active_pregnancy_id') else None};obj.update(task_details.validate(c,data,defaults=True));put(c,'task',obj,fid)
    if assignee!=user:notify(c,fid,assignee,'你收到一项新的家庭安排')
   audit(c,fid,user,action,{'id':obj['id']});return {'id':obj['id']}
  elif action in ('task.update','appointment.update'):
@@ -578,6 +579,11 @@ def mutate(c,user,fid,action,data):
    if 'note' in data:obj['note']=text(data['note'] or '以机构实际安排为准',500)
    if obj['date']!=original['date'] or obj['status']!=original['status']:reset_reminder(c,fid,obj)
   else:
+   if kind=='task' and any(k in data for k in ('steps','knowledge_ids')):
+    if role!='dad':raise Problem(403,'只有统筹者可以编辑任务步骤与知识')
+    details=task_details.validate(c,data)
+    if obj.get('template_source') and any(obj.get(k,[])!=v for k,v in details.items()):obj['details_customized']=True
+    obj.update(details)
    desired=data.get('status',obj['status'])
    if 'status' in data:obj.pop('lifecycle_cancelled_by',None);obj.pop('status_before_lifecycle',None)
    if desired not in ('todo','in_progress','done','skipped','cancelled') and not (desired=='pending' and 'status' not in data):raise Problem(400,'状态不正确')
@@ -590,7 +596,7 @@ def mutate(c,user,fid,action,data):
       if key in ('title','name'):text(data[key],100)
       obj[key]=data[key]
       if key=='due_date':obj['user_override']=True
-   if obj.get('series_id') and any(obj.get(k)!=original.get(k) for k in ('title','note','assignee','due_date')):obj['series_override']=True
+   if obj.get('series_id') and any(obj.get(k)!=original.get(k) for k in ('title','note','assignee','due_date','steps','knowledge_ids')):obj['series_override']=True
    if desired!=obj['status']:
     if obj['assignee']!=user:raise Problem(403,'只能提交自己负责事项的执行结果')
     if desired=='done' and f['mode']!='off' and role!='mom' and (f['mode']=='all' or kind=='task'):
@@ -599,7 +605,7 @@ def mutate(c,user,fid,action,data):
      a=get(c,'approval',result['approval_id']);a['payload']['version']=obj['version']+1;put(c,'approval',a,fid);return result
     obj['status']=desired;obj['completed_at']=now() if desired=='done' else None
    for a in rows(c,'approval',fid):
-    if a['target']==obj['id'] and a['status']=='pending':a['status']='cancelled';put(c,'approval',a,fid)
+    if a['target']==obj['id'] and a['status']=='pending':a['status']='cancelled';put(c,'approval',a,fid);cancel_notifications(c,fid,a['id'])
    if obj['status']=='pending':obj['status']='in_progress'
    if any(obj.get(k)!=original.get(k) for k in ('status','assignee','due_date')):reset_reminder(c,fid,obj)
   put(c,kind,obj,fid);audit(c,fid,user,action,{'id':obj['id']})

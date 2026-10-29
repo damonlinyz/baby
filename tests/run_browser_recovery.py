@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 
 def main(scenario='recovery'):
- if scenario not in ('recovery','recurring','bag','calendar','reports','recurring_rules'):raise ValueError('unknown browser scenario')
+ if scenario not in ('recovery','recurring','bag','calendar','reports','recurring_rules','task_details'):raise ValueError('unknown browser scenario')
  root=Path(__file__).resolve().parents[1]
  with tempfile.TemporaryDirectory(prefix='baba-browser-') as directory:
   with socket.socket() as listener:
