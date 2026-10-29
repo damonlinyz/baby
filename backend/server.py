@@ -4,13 +4,13 @@ import os,sys,json,time,hashlib,secrets,threading,urllib.parse,urllib.request,sq
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 from pathlib import Path
 import domain as d
-import payments,lifecycle,calendar_export,reports,task_details
+import payments,lifecycle,calendar_export,reports,task_details,briefings,sharing,push_notifications
 ROOT=Path(__file__).resolve().parent.parent
 PORT=int(os.environ.get('PORT','8766'));HOST=os.environ.get('HOST','127.0.0.1')
 PUBLIC_ORIGIN=os.environ.get('PUBLIC_ORIGIN',f'http://127.0.0.1:{PORT}')
 STATIC={'/':'index.html','/index.html':'index.html','/app.js':'app.js','/style.css':'style.css','/request-recovery.js':'clients/weapp/lib/recovery.js','/api-client.js':'api-client.js','/native-payment.js':'native-payment.js','/demo/':'demo/index.html','/demo/app.js':'demo/app.js','/demo/style.css':'demo/style.css'}
 PRODUCTS=[{'sku':'core','name':'核心产品买断','price_fen':12800,'description':'核心产品及核心更新，赠首个 30 天有限额 AI'}, {'sku':'ai30','name':'AI 30 天包','price_fen':2500,'description':'拟定：300 次成功问答，5 份周简报；正式开售前需成本验证'}]
-def integrations():return {'ai':bool(os.environ.get('AI_API_KEY') and os.environ.get('AI_BASE_URL') and os.environ.get('AI_MODEL')),'wechat':payments.configured('wechat'),'alipay':payments.configured('alipay'),'wechat_login':bool(os.environ.get('WX_APP_ID') and os.environ.get('WX_APP_SECRET')),'push':False,'payment_mode':'configured' if payments.configured('wechat') or payments.configured('alipay') else 'not_configured','service_mode':os.environ.get('SERVICE_MODE','self_hosted'),'sales_enabled':os.environ.get('PAYMENTS_ENABLED')=='1'}
+def integrations():return {'ai':bool(os.environ.get('AI_API_KEY') and os.environ.get('AI_BASE_URL') and os.environ.get('AI_MODEL')),'wechat':payments.configured('wechat'),'alipay':payments.configured('alipay'),'wechat_login':bool(os.environ.get('WX_APP_ID') and os.environ.get('WX_APP_SECRET')),'push':bool(push_notifications.configured()),'payment_mode':'configured' if payments.configured('wechat') or payments.configured('alipay') else 'not_configured','service_mode':os.environ.get('SERVICE_MODE','self_hosted'),'sales_enabled':os.environ.get('PAYMENTS_ENABLED')=='1'}
 
 def wechat_identity(code):
  if not os.environ.get('WX_APP_ID') or not os.environ.get('WX_APP_SECRET'):raise d.Problem(503,'微信登录尚未配置')
@@ -124,12 +124,16 @@ class Handler(BaseHTTPRequestHandler):
    self.validate_host();path=urllib.parse.urlsplit(self.path).path;q=urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
    if path in STATIC:
     p=ROOT/STATIC[path];ct='text/html; charset=utf-8' if p.suffix=='.html' else 'text/css; charset=utf-8' if p.suffix=='.css' else 'application/javascript; charset=utf-8';self.respond(p.read_bytes(),content_type=ct);return
+   if path=='/api/public/template':self.respond(sharing.public_template());return
    if path=='/api/health':self.respond({'ok':True,'schema_version':1,'integrations':integrations()});return
-   if path not in ('/api/me','/api/state','/api/admin','/api/products','/api/export','/api/audit','/api/pregnancy/history','/api/calendar','/api/report','/api/task/knowledge'):raise d.Problem(404,'接口不存在')
+   if path not in ('/api/me','/api/state','/api/admin','/api/products','/api/export','/api/audit','/api/pregnancy/history','/api/calendar','/api/report','/api/task/knowledge','/api/briefings','/api/briefing','/api/notification-options'):raise d.Problem(404,'接口不存在')
    with d.transaction() as c:
     s=self.identity(c);user=s['user_id']
     if path=='/api/me':result={'user':d.profile(c,user),'csrf':s['csrf'],'integrations':integrations()}
     elif path=='/api/state':result=d.snapshot(c,user,q.get('family_id',[''])[0]);result['integrations']=integrations()
+    elif path=='/api/notification-options':result=push_notifications.options()
+    elif path=='/api/briefings':result=briefings.listing(c,q.get('family_id',[''])[0],user)
+    elif path=='/api/briefing':result=briefings.read(c,q.get('family_id',[''])[0],user,q.get('id',[''])[0])
     elif path=='/api/task/knowledge':result=task_details.read_knowledge(c,q.get('family_id',[''])[0],user,q.get('task_id',[''])[0],q.get('knowledge_id',[''])[0])
     elif path=='/api/report':result=reports.build(d.snapshot(c,user,q.get('family_id',[''])[0]),q.get('week',[None])[0])
     elif path=='/api/calendar':result=calendar_export.export(c,user,q.get('family_id',[''])[0],q.get('start',[None])[0],q.get('end',[None])[0])
@@ -170,6 +174,10 @@ class Handler(BaseHTTPRequestHandler):
    except (ValueError,UnicodeDecodeError):raise d.Problem(400,'JSON 格式不正确')
    if not isinstance(data,dict):raise d.Problem(400,'请求需要为对象')
    path=urllib.parse.urlsplit(self.path).path;cookie=None
+   if path=='/api/shared':
+    with d.transaction() as c:d.rate(c,'share-view:'+self.client_address[0],120,300)
+    with d.transaction() as c:result=sharing.view(c,data.get('token'))
+    self.respond(result);return
    if path=='/api/wechat/login':
     identity=wechat_identity(data.get('code'))
     with d.transaction() as c:
@@ -195,10 +203,11 @@ class Handler(BaseHTTPRequestHandler):
    if path=='/api/wechat/bind':
     identity=wechat_identity(data.get('code'))
     with d.transaction() as c:
+     self.identity(c,True)
      existing=next((x for x in d.rows(c,'wechat_identity') if x['openid']==identity['openid'] and x['appid']==identity['appid']),None)
      if existing and existing['user_id']!=user:raise d.Problem(409,'该微信身份已绑定其他账号，当前不可合并')
-     if not existing:d.put(c,'wechat_identity',dict(identity,id=d.uid(),user_id=user))
-    self.respond({'ok':True});return
+     if not existing:existing=d.put(c,'wechat_identity',dict(identity,id=d.uid(),user_id=user))
+    self.respond({'ok':True,'identity_id':existing['id']});return
    if path=='/api/orders':self.respond(payments.create(user,data));return
    if path=='/api/orders/query':self.respond(payments.query(user,data.get('order_id')));return
    if path=='/api/refunds':self.respond(payments.request_refund(user,data.get('order_id'),data.get('reason')));return

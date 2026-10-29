@@ -118,5 +118,8 @@ def mutate(c, user, fid, action, data):
             if previous['assignee'] != obj['assignee'] and obj['assignee'] != user:
                 d.notify(c, fid, obj['assignee'], '你收到一项物品准备分工', obj['id'])
         d.put(c, 'item', obj, fid)
+        if action=='item.update' and obj['status']=='done' and previous['status']!='done':
+            import engagement
+            engagement.record(c,fid,'item',obj)
     d.audit(c, fid, user, action, {'id': obj['id']})
     return {'id': obj['id']}

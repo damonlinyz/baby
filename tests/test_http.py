@@ -5,7 +5,7 @@ class HttpTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):
   cls.tmp=tempfile.TemporaryDirectory();s=socket.socket();s.bind(('127.0.0.1',0));cls.port=s.getsockname()[1];s.close();cls.base='http://127.0.0.1:'+str(cls.port)
-  env=dict(os.environ,PORT=str(cls.port),PUBLIC_ORIGIN=cls.base,BABA_DB=str(Path(cls.tmp.name)/'http.sqlite3'),PYTHONDONTWRITEBYTECODE='1');env.pop('ADMIN_USER_ID',None);env.pop('PAYMENTS_ENABLED',None)
+  env=dict(os.environ,PORT=str(cls.port),PUBLIC_ORIGIN=cls.base,BABA_DB=str(Path(cls.tmp.name)/'http.sqlite3'),PYTHONDONTWRITEBYTECODE='1',WX_NOTIFY_ENABLED='0');env.pop('ADMIN_USER_ID',None);env.pop('PAYMENTS_ENABLED',None)
   cls.proc=subprocess.Popen([sys.executable,str(ROOT/'backend/server.py')],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
   for _ in range(100):
    try:urllib.request.urlopen(cls.base+'/api/health',timeout=.2);break

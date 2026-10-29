@@ -271,3 +271,53 @@ test('WeChat readonly task exposes steps without enabling editing and foreground
  const {page}=wechat(async()=>({statusCode:200,data:snapshot()}));page.data.role='mom';page.data.state={...snapshot(),tasks:[{id:'task',version:1,title:'只读任务',note:'说明',assignee:'mom',steps:['第一步'],knowledge_ids:[]}]};
  page.openTask({currentTarget:{dataset:{id:'task'}}});assert.equal(page.data.taskReadOnly,true);assert.equal(page.data.taskDetail.stepRows[0].text,'第一步');page._shown=true;page.onShow();await settled(page);assert.equal(page.data.taskDetail,null);assert.equal(page.data.modal,'');
 });
+
+test('WeChat badge check-in requires confirmation and submits a server-day declaration only',async()=>{
+ const {page,calls,wx}=wechat(async o=>({statusCode:200,data:o.url.endsWith('/action')?{date:'2026-10-29'}:snapshot()}));
+ wx.showModal=o=>o.success({confirm:false});page.checkin();await settled(page);assert.equal(calls.length,0);
+ wx.showModal=o=>o.success({confirm:true});page.checkin();await settled(page);const c=calls.find(c=>c.path.endsWith('/action')).data;assert.equal(c.action,'engagement.checkin');assert.deepEqual(c.data,{confirmed:true});assert.equal('date' in c.data,false);
+});
+
+test('WeChat advanced reminders submit typed limits, booleans and lead-day arrays',async()=>{
+ const {page,calls}=wechat(async o=>({statusCode:200,data:o.url.endsWith('/action')?{ok:true}:snapshot()}));
+ page.data.form={enabled:true,appointment_enabled:true,approval_enabled:false,weekly_enabled:true,quiet_enabled:true,merge_enabled:true,quiet_start:'22:00',quiet_end:'08:00',daily_limit:'3',merge_limit:'2',appointment_days_text:'3,1,0',task_days_text:'1,0'};
+ page.saveReminders();await settled(page);const c=calls.find(c=>c.path.endsWith('/action')).data;assert.equal(c.action,'notification.preferences');assert.equal(c.data.daily_limit,3);assert.equal(c.data.merge_limit,2);assert.equal(c.data.approval_enabled,false);assert.deepEqual(c.data.appointment_days,[3,1,0]);
+});
+
+test('WeChat automatic briefing fetches recipient-scoped snapshot and clears it on foreground reload',async()=>{
+ const {page}=wechat(async o=>({statusCode:200,data:o.url.includes('/briefing?')?{status:'active',payload:{private:'old-body'}}:snapshot()}));
+ page.readBriefing({currentTarget:{dataset:{id:'brief'}}});await settled(page);assert.equal(page.data.autoBriefing.payload.private,'old-body');page._shown=true;page.onShow();await settled(page);assert.equal(page.data.autoBriefing,null);assert.equal(page.data.modal,'');
+});
+
+test('WeChat private sharing includes only selected item ids and explicit consent',async()=>{
+ const {page,calls,wx,app}=wechat(async o=>({statusCode:200,data:o.url.endsWith('/action')?{id:'share',token:'synthetic-token',path:'/#share=synthetic-token'}:{...snapshot(),shares:[{id:'share',active:true}]}}));
+ page.data.form={item_ids:['item-one'],hours:'24',confirmed:true};page.createShare();await settled(page);
+ const c=calls.find(c=>c.path.endsWith('/action')).data;assert.equal(c.action,'share.create');assert.deepEqual(c.data,{item_ids:['item-one'],hours:24,confirmed:true});assert.equal(page.data.modal,'share-result');
+ let copied='';wx.setClipboardData=o=>{copied=o.data};page.copyShare();assert.equal(copied,app.globalData.baseUrl+'/#share=synthetic-token');
+ const publicShare=page.onShareAppMessage();assert.equal(publicShare.path,'/pages/main/main?template=1');assert.equal(JSON.stringify(publicShare).includes('synthetic-token'),false);
+ page.close();assert.equal(page.data.shareResult,null);
+});
+
+test('WeChat viewing generic template never sends family ids and works before sign-in',async()=>{
+ const {page,calls}=wechat(async()=>({statusCode:200,data:{title:'通用模板',items:[]}}));page.data.auth=false;page.data.familyId='';page.showPublicTemplate();await settled(page);
+ assert.match(calls[0].path,/\/public\/template$/);assert.equal(calls[0].data,null);assert.equal(page.data.modal,'public-template');
+});
+
+test('WeChat subscription requests explicit template consent once and never treats rejection as permission',async()=>{
+ const {page,calls,wx}=wechat(async o=>({statusCode:200,data:o.url.endsWith('/notification-options')?{configured:true,template_id:'template'}:o.url.endsWith('/action')?{ok:true}:o.url.endsWith('/wechat/bind')?{ok:true,identity_id:'identity'}:snapshot()}));
+ wx.login=o=>o.success({code:'synthetic-code'});wx.requestSubscribeMessage=o=>o.success({template:'reject'});page.requestSubscription();await settled(page);assert.equal(calls.filter(c=>c.path.endsWith('/action')).length,0);
+ wx.requestSubscribeMessage=o=>o.success({template:'accept'});page.requestSubscription();await settled(page);const c=calls.find(c=>c.path.endsWith('/action')).data;assert.equal(c.action,'notification.subscribe');assert.deepEqual(c.data,{accepted:true,template_id:'template',identity_id:'identity'});
+});
+
+test('late WeChat subscription consent after sign-out cannot grant a different session permission',async()=>{
+ const {page,app,calls,wx}=wechat(async o=>({statusCode:200,data:o.url.endsWith('/notification-options')?{configured:true,template_id:'template'}:{ok:true,identity_id:'identity'}}));
+ let consent;wx.login=o=>o.success({code:'synthetic'});wx.requestSubscribeMessage=o=>{consent=o};page.requestSubscription();
+ for(let i=0;i<20&&!consent;i++)await new Promise(setImmediate);assert.ok(consent);app.clearSession();consent.success({template:'accept'});await settled(page);
+ assert.equal(calls.filter(c=>c.path.endsWith('/action')).length,0);assert.equal(page.data.auth,false);
+});
+
+test('WeChat command recovery never presents a revoked share as a fresh usable link',async()=>{
+ const {page,app}=wechat(async()=>({statusCode:200,data:snapshot()}));page.data.state={...snapshot(),shares:[{id:'share',active:false}]};
+ app.retryCommand=async()=>({id:'share',token:'synthetic-token',path:'/#share=synthetic-token'});page.recover();await settled(page);assert.equal(page.data.shareResult,null);assert.equal(page.data.modal,'shares');
+ page.data.state.shares[0].active=true;page.recover();await settled(page);assert.equal(page.data.modal,'share-result');assert.equal(page.data.shareResult.token,'synthetic-token');
+});

@@ -110,6 +110,7 @@ def restore(snapshot, ledger, output):
                         d.erase_account(recovered, user)
                         deleted += 1
                     # Restored sessions/grants/invites must not revive previous access.
+                    recovered.execute("DELETE FROM records WHERE kind IN ('share','reminder','subscription','external_delivery')")
                     recovered.execute('DELETE FROM sessions')
                     recovered.execute('DELETE FROM requests')
                     recovered.execute("UPDATE command_requests SET result='{}',invalidated=1")
@@ -134,6 +135,11 @@ def restore(snapshot, ledger, output):
                             if not notice['read'] and not notice.get('cancelled'):
                                 notice['cancelled'] = True
                                 d.put(recovered, 'notification', notice, fid)
+                    import briefings
+                    for family in d.rows(recovered,'family'):
+                        fid=family['id']
+                        for member in recovered.execute('SELECT user_id FROM memberships WHERE family_id=? AND active=1',(fid,)).fetchall():
+                            briefings.listing(recovered,fid,member['user_id'])
                     recovered.execute("INSERT OR REPLACE INTO metadata VALUES('restored_at',?)", (str(d.now()),))
                     recovered.commit()
                 except Exception:

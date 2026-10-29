@@ -1,6 +1,6 @@
 """SQLite domain layer. Mutations run under BEGIN IMMEDIATE; callers supply authenticated actor."""
 import os,json,sqlite3,secrets,hashlib,hmac,time,datetime,contextlib
-import templates,dates,lifecycle,recurring,bag,reports,task_details
+import templates,dates,lifecycle,recurring,bag,reports,task_details,engagement,reminders,briefings,sharing,push_notifications
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent.parent
 DB=Path(os.environ.get('BABA_DB',str(ROOT/'private'/'baba.sqlite3')))
@@ -60,7 +60,11 @@ def rows(c,kind,family_id=None):
  if family_id is None:rs=c.execute('SELECT body FROM records WHERE kind=?',(kind,))
  else:rs=c.execute('SELECT body FROM records WHERE kind=? AND family_id=?',(kind,family_id))
  return [json.loads(r['body']) for r in rs]
-def audit(c,fid,actor,type,body):c.execute('INSERT INTO events VALUES(?,?,?,?,?,?)',(uid(),fid,actor,type,dumps(body),now()))
+def audit(c,fid,actor,type,body):
+ if type in ('member.join','member.remove','member.leave','family.transferred'):
+  sharing.invalidate_family(c,fid);briefings.invalidate_family(c,fid);push_notifications.invalidate_family(c,fid)
+ if type=='health.consent.changed' and body.get('grantee') and body.get('scope') in ('health_read','baby_read'):briefings.invalidate_family(c,fid,body.get('grantee'))
+ c.execute('INSERT INTO events VALUES(?,?,?,?,?,?)',(uid(),fid,actor,type,dumps(body),now()))
 def member(c,fid,user,roles=None):
  m=c.execute('SELECT * FROM memberships WHERE family_id=? AND user_id=? AND active=1',(fid,user)).fetchone()
  if not m or (roles and m['role'] not in roles):raise Problem(403,'你没有执行此操作的家庭权限')
@@ -125,10 +129,19 @@ def can_view_task(c,fid,user,task):
  if task.get('private_health_anchor') and not can_health(c,fid,user,p):return False
  return task.get('template_key') not in lifecycle.BABY_TEMPLATE_KEYS or lifecycle.can_read_babies(c,fid,user,p)
 def can_view_notification(c,fid,user,n):
+ if n.get('delivery_refs'):
+  for id in n['delivery_refs']:
+   row=c.execute("SELECT body FROM records WHERE kind='reminder' AND id=?",(id,)).fetchone()
+   if not row:return False
+   q=json.loads(row['body'])
+   if q['source']!='briefing' and not reminders.valid(c,fid,q):return False
  if n.get('pregnancy_id') and n.get('health_sensitive',True) and not can_health(c,fid,user,get(c,'pregnancy',n['pregnancy_id'])):return False
  row=c.execute("SELECT body FROM records WHERE kind='task' AND id=?",(n.get('ref'),)).fetchone()
  return not row or can_view_task(c,fid,user,json.loads(row['body']))
 def notify(c,fid,user,title,ref=None):
+ approval=c.execute("SELECT body FROM records WHERE kind='approval' AND id=? AND family_id=?",(ref,fid)).fetchone() if ref else None
+ if approval:
+  obj=json.loads(approval['body']);reminders.enqueue(c,fid,'approval-'+ref,user,'approval','approval',ref,title,expected_status=obj['status']);reminders.deliver(c,fid,user);return
  put(c,'notification',{'id':uid(),'recipient':user,'title':title,'ref':ref,'read':False,'created_at':now()},fid)
 def require_active(c,fid,kind,id):
  obj=get(c,kind,id)
@@ -239,7 +252,7 @@ def erase_account(c,user):
    removed.add(t['id']);c.execute("DELETE FROM records WHERE kind='task' AND id=?",(t['id'],))
   else:
    t['pregnancy_id']=None;t['stage']=None;put(c,'task',t,row['family_id'])
- for kind in ('pregnancy','pregnancy_event','baby_event','outbox','appointment','baby','chat','consent','wechat_identity','notification_preferences','ai_usage','transfer'):
+ for kind in ('pregnancy','pregnancy_event','baby_event','outbox','appointment','baby','chat','consent','wechat_identity','notification_preferences','engagement_preferences','subscription','external_delivery','completion_fact','checkin','support_fact','ai_usage','transfer'):
   for obj in rows(c,kind):
    if obj.get('pregnancy_id') in owned or obj['id'] in owned or any(obj.get(k)==user for k in ('subject_id','owner','subject','grantee','user_id','from','to')):
     removed.add(obj['id']);c.execute('DELETE FROM records WHERE kind=? AND id=?',(kind,obj['id']))
@@ -248,9 +261,15 @@ def erase_account(c,user):
    removed.add(a['id']);c.execute("DELETE FROM records WHERE kind='approval' AND id=?",(a['id'],))
  for n in rows(c,'notification'):
   if n['recipient']==user or n.get('pregnancy_id') in owned or n.get('ref') in removed:c.execute("DELETE FROM records WHERE kind='notification' AND id=?",(n['id'],))
+ for kind in ('completion_fact','support_fact'):
+  for obj in rows(c,kind):
+   if obj.get('target') in removed:c.execute('DELETE FROM records WHERE kind=? AND id=?',(kind,obj['id']))
  for event in c.execute("SELECT id,actor,body FROM events WHERE type LIKE 'health.%'").fetchall():
-  if event['actor']==user or json.loads(event['body']).get('pregnancy_id') in owned:c.execute('DELETE FROM events WHERE id=?',(event['id'],))
+  if event['actor']==user or json.loads(event['body']).get('pregnancy_id') in owned or json.loads(event['body']).get('grantee')==user:c.execute('DELETE FROM events WHERE id=?',(event['id'],))
  # Erase results but retain deduplication keys, so a retry cannot recreate deleted data.
+ for kind in ('briefing','share','reminder','external_delivery'):
+  for row in c.execute('SELECT id,family_id FROM records WHERE kind=?',(kind,)).fetchall():
+   if row['family_id'] in affected:c.execute('DELETE FROM records WHERE kind=? AND id=?',(kind,row['id']))
  for fid in affected:c.execute("UPDATE command_requests SET result='{}',invalidated=1 WHERE family_id=?",(fid,))
  c.execute('DELETE FROM requests WHERE user_id=?',(user,))
  c.execute('DELETE FROM users WHERE id=?',(user,))
@@ -284,8 +303,12 @@ def snapshot(c,user,fid):
  orders=[o for o in rows(c,'order',fid) if o['payer']==user]
  order_ids={o['id'] for o in orders}
  refunds=[r for r in rows(c,'refund',fid) if r['order_id'] in order_ids]
- result={'calendar_date':str(today(f.get('timezone',dates.DEFAULT_TIMEZONE))),'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'task_series':[task_details.decorate(s,knowledge) for s in rows(c,'task_series',fid) if me['role']!='member' or s['assignee']==user],'items':items,'deleted_items':[i for i in all_items if i.get('deleted')] if me['role']=='dad' else [],'pregnancy':p,'babies':babies,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and can_view_notification(c,fid,user,n)], 'reminder_preferences':next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==user),{'enabled':True}), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'refunds':refunds,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
+ result={'calendar_date':str(today(f.get('timezone',dates.DEFAULT_TIMEZONE))),'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'task_series':[task_details.decorate(s,knowledge) for s in rows(c,'task_series',fid) if me['role']!='member' or s['assignee']==user],'items':items,'deleted_items':[i for i in all_items if i.get('deleted')] if me['role']=='dad' else [],'pregnancy':p,'babies':babies,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and can_view_notification(c,fid,user,n)], 'reminder_preferences':reminders.preferences(c,fid,user), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'refunds':refunds,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
  result['weekly_report']=reports.build(result)
+ result['engagement']=engagement.summary(c,fid,user,result)
+ result['briefings']=briefings.metadata(c,fid,user)
+ result['shares']=sharing.listing(c,fid,user)
+ result['notification_delivery']=[{'id':r['id'],'status':r['status']} for r in rows(c,'external_delivery',fid) if r['user_id']==user]
  return result
 def propose(c,fid,user,resource,action,payload,target=None):
  mom=c.execute("SELECT user_id FROM memberships WHERE family_id=? AND role='mom' AND active=1",(fid,)).fetchone()
@@ -327,9 +350,10 @@ def apply_family_settings(c,fid,payload):
     if obj['status'] in ('todo','in_progress','scheduled') and (obj.get('due_date') or kind=='appointment'):
      reset_reminder(c,fid,obj);put(c,kind,obj,fid)
 def complete(c,fid,kind,obj):
- obj['status']='done';obj['completed_at']=now();reset_reminder(c,fid,obj);return put(c,kind,obj,fid)
+ obj['status']='done';obj['completed_at']=now();reset_reminder(c,fid,obj);saved=put(c,kind,obj,fid);engagement.record(c,fid,kind,saved);return saved
 
 def cancel_notifications(c,fid,ref):
+ reminders.cancel_ref(c,fid,ref)
  for n in rows(c,'notification',fid):
   if n.get('ref')==ref and not n['read'] and not n.get('cancelled'):
    n['cancelled']=True;put(c,'notification',n,fid)
@@ -478,13 +502,12 @@ def transition(c,fid,user,p,data):
 
 def mutate(c,user,fid,action,data):
  me=member(c,fid,user);role=me['role'];f=get(c,'family',fid)
- if action=='notification.preferences':
-  prefs={'id':fid+'-'+user,'user_id':user,'enabled':data.get('enabled') is True};put(c,'notification_preferences',prefs,fid)
-  if not prefs['enabled']:
-   task_ids={t['id'] for t in rows(c,'task',fid)}
-   for n in rows(c,'notification',fid):
-    if n['recipient']==user and n.get('ref') in task_ids and not n['read'] and not n.get('cancelled'):n['cancelled']=True;put(c,'notification',n,fid)
-  return {'ok':True}
+ if action.startswith('engagement.'):return engagement.mutate(c,fid,user,action,data)
+ if action=='notification.subscribe':return push_notifications.subscribe(c,fid,user,data)
+ if action=='notification.preferences':return reminders.save(c,fid,user,data)
+ if action=='briefing.refresh':return {'id':briefings.generate(c,fid,user,force=True)}
+ if action=='share.create':return sharing.create(c,fid,user,data)
+ if action=='share.revoke':return sharing.revoke(c,fid,user,data)
  if action=='ai.activate_gift':
   gifts=[e for e in rows(c,'entitlement',fid) if e['owner']==user and e['benefit']=='ai_gift' and e['status']=='unactivated']
   if not gifts:raise Problem(409,'没有待激活的赠送 AI')
@@ -608,7 +631,9 @@ def mutate(c,user,fid,action,data):
     if a['target']==obj['id'] and a['status']=='pending':a['status']='cancelled';put(c,'approval',a,fid);cancel_notifications(c,fid,a['id'])
    if obj['status']=='pending':obj['status']='in_progress'
    if any(obj.get(k)!=original.get(k) for k in ('status','assignee','due_date')):reset_reminder(c,fid,obj)
-  put(c,kind,obj,fid);audit(c,fid,user,action,{'id':obj['id']})
+  put(c,kind,obj,fid)
+  if kind=='task' and original['status']!='done' and obj['status']=='done':engagement.record(c,fid,kind,obj)
+  audit(c,fid,user,action,{'id':obj['id']})
  elif action=='approval.decide':
   a=require_active(c,fid,'approval',data.get('id'));version(a,data)
   if a['approver']!=user:raise Problem(403,'只能由指定确认人处理')
@@ -651,7 +676,7 @@ def mutate(c,user,fid,action,data):
    if g['subject']==user and g['grantee']==grantee and g['scope']==scope and not g.get('revoked_at'):g['revoked_at']=now();put(c,'consent',g,fid)
   if data.get('enabled') is True:put(c,'consent',{'id':uid(),'subject':user,'grantee':grantee,'scope':scope,'notice_version':'1.0','granted_at':now(),'revoked_at':None},fid)
   clean_health_access(c,fid)
-  audit(c,fid,user,'health.consent.changed',{'scope':scope,'enabled':data.get('enabled') is True})
+  audit(c,fid,user,'health.consent.changed',{'scope':scope,'grantee':grantee,'enabled':data.get('enabled') is True})
  elif action=='notification.read':
   n=require_active(c,fid,'notification',data.get('id'))
   if n['recipient']!=user:raise Problem(403,'无权读取此提醒')
@@ -707,33 +732,7 @@ def publish_knowledge(c,user,data):
 
 def tick():
  with transaction() as c:
-  for a in rows(c,'appointment'):
-   if a['status']!='scheduled' or a.get('reminded'):continue
-   r=c.execute("SELECT family_id FROM records WHERE kind='appointment' AND id=?",(a['id'],)).fetchone();fid=r['family_id']
-   current=today(get(c,'family',fid).get('timezone',dates.DEFAULT_TIMEZONE))
-   if not current<=date(a['date'])<=current+datetime.timedelta(days=3):continue
-   p=get(c,'pregnancy',a['pregnancy_id']) if a.get('pregnancy_id') else None
-   if p and (p['paused'] or p['archived'] or p['state']=='ended'):continue
-   if p and not can_health(c,fid,a['owner'],p):continue
-   if not c.execute('SELECT 1 FROM memberships WHERE family_id=? AND user_id=? AND active=1',(fid,a['owner'])).fetchone():continue
-   key='appointment-'+a['id']+('-r'+str(a['reminder_revision']) if a.get('reminder_revision') else '')
-   n={'id':key,'recipient':a['owner'],'title':'有一项预约即将到来，请查看安排','ref':a['id'],'pregnancy_id':a.get('pregnancy_id'),'read':False,'created_at':now()}
-   if not c.execute("SELECT 1 FROM records WHERE kind='notification' AND id=?",(n['id'],)).fetchone():put(c,'notification',n,fid)
-   a['reminded']=True;put(c,'appointment',a,fid)
-  for f in rows(c,'family'):expire_approvals(c,f['id']);recurring.sync(c,f['id']);process_outbox(c,f['id'])
-
-  for task in rows(c,'task'):
-   if task['status'] not in ('todo','in_progress') or not task.get('due_date'):continue
-   fid=c.execute("SELECT family_id FROM records WHERE kind='task' AND id=?",(task['id'],)).fetchone()[0]
-   current=today(get(c,'family',fid).get('timezone',dates.DEFAULT_TIMEZONE))
-   if not current<=date(task['due_date'])<=current+datetime.timedelta(days=1):continue
-   if not c.execute('SELECT 1 FROM memberships WHERE family_id=? AND user_id=? AND active=1',(fid,task['assignee'])).fetchone():continue
-   if task.get('pregnancy_id'):
-    p=get(c,'pregnancy',task['pregnancy_id'])
-    if p['paused'] or p['archived'] or p['state']=='ended':continue
-    if not can_view_task(c,fid,task['assignee'],task):continue
-   prefs=next((x for x in rows(c,'notification_preferences',fid) if x['user_id']==task['assignee']),None)
-   if prefs and not prefs['enabled']:continue
-   id='task-'+task['id']+'-'+str(task.get('due_date'))+('-r'+str(task['reminder_revision']) if task.get('reminder_revision') else '')
-   if not c.execute("SELECT 1 FROM records WHERE kind='notification' AND id=?",(id,)).fetchone():
-    put(c,'notification',{'id':id,'recipient':task['assignee'],'title':'有一项家庭安排临近，请查看待办','ref':task['id'],'pregnancy_id':task.get('pregnancy_id'),'health_sensitive':bool(task.get('private_health_anchor')),'read':False,'created_at':now()},fid)
+  for f in rows(c,'family'):
+   fid=f['id'];expire_approvals(c,fid);recurring.sync(c,fid);process_outbox(c,fid)
+   reminders.schedule(c,fid);briefings.schedule(c,fid);reminders.deliver(c,fid);sharing.expire(c,fid)
+ push_notifications.dispatch()

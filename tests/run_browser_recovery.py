@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 
 def main(scenario='recovery'):
- if scenario not in ('recovery','recurring','bag','calendar','reports','recurring_rules','task_details'):raise ValueError('unknown browser scenario')
+ if scenario not in ('recovery','recurring','bag','calendar','reports','recurring_rules','task_details','care_features'):raise ValueError('unknown browser scenario')
  root=Path(__file__).resolve().parents[1]
  with tempfile.TemporaryDirectory(prefix='baba-browser-') as directory:
   with socket.socket() as listener:
@@ -22,7 +22,7 @@ def main(scenario='recovery'):
   today=datetime.datetime.now(ZoneInfo('Asia/Shanghai')).date()
   env=dict(os.environ,BABA_DB=str(Path(directory)/'synthetic.sqlite3'),HOST='127.0.0.1',PORT=str(port),
            PUBLIC_ORIGIN=base,TEST_BASE=base,TEST_EDD=str(today+datetime.timedelta(days=100)),
-           PAYMENTS_ENABLED='0',AI_SALES_APPROVED='0',AI_API_KEY='',PYTHONDONTWRITEBYTECODE='1')
+           PAYMENTS_ENABLED='0',WX_NOTIFY_ENABLED='0',AI_SALES_APPROVED='0',AI_API_KEY='',PYTHONDONTWRITEBYTECODE='1')
   with (Path(directory)/'server.log').open('w') as log:
    server=subprocess.Popen([sys.executable,str(root/'backend/server.py')],cwd=root,env=env,stdout=log,stderr=log)
    try:
