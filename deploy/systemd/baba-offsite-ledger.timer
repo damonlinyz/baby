@@ -1,0 +1,8 @@
+[Unit]
+Description=Independent deletion-ledger replica every fifteen minutes
+[Timer]
+OnCalendar=*-*-* *:04,19,34,49:00
+Persistent=true
+Unit=baba-offsite@ledger.service
+[Install]
+WantedBy=timers.target

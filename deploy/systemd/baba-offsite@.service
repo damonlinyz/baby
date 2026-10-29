@@ -1,0 +1,19 @@
+[Unit]
+Description=Replicate encrypted Baba %i backup and verify remote bytes
+
+[Service]
+Type=oneshot
+User=baba
+Group=baba
+WorkingDirectory=/opt/baba
+EnvironmentFile=/etc/baba-backup/common.env
+EnvironmentFile=/etc/baba-backup/offsite-%i.env
+ExecStart=/usr/bin/python3 /opt/baba/backend/offsite.py sync --db ${BABA_BACKUP_DB} --directory ${BABA_BACKUP_DIR} --kind %i --alert
+TimeoutStartSec=20min
+UMask=0077
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/baba/private
+ReadWritePaths=/var/lib/baba/backups

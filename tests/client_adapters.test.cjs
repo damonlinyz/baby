@@ -24,6 +24,9 @@ function wechat(respond){
  });
  vm.runInContext(fs.readFileSync(path.join(root,'clients/weapp/app.js'),'utf8'),context);
  app.onLaunch();
+ const modules=new Map();
+ const load=file=>{if(modules.has(file))return modules.get(file);const m={exports:{}};const fn=vm.runInContext('(function(require,module,exports){'+fs.readFileSync(file,'utf8')+'\n})',context);fn(name=>load(path.resolve(path.dirname(file),name+'.js')),m,m.exports);modules.set(file,m.exports);return m.exports};
+ context.require=name=>load(path.resolve(root,'clients/weapp/pages/main',name+'.js'));
  vm.runInContext(fs.readFileSync(path.join(root,'clients/weapp/pages/main/main.js'),'utf8'),context);
  page.data.familyId='family';page.data.auth=true;page.data.user={id:'mom'};
  return {app,page,stored,calls,toasts,wx};
@@ -320,4 +323,43 @@ test('WeChat command recovery never presents a revoked share as a fresh usable l
  const {page,app}=wechat(async()=>({statusCode:200,data:snapshot()}));page.data.state={...snapshot(),shares:[{id:'share',active:false}]};
  app.retryCommand=async()=>({id:'share',token:'synthetic-token',path:'/#share=synthetic-token'});page.recover();await settled(page);assert.equal(page.data.shareResult,null);assert.equal(page.data.modal,'shares');
  page.data.state.shares[0].active=true;page.recover();await settled(page);assert.equal(page.data.modal,'share-result');assert.equal(page.data.shareResult.token,'synthetic-token');
+});
+
+test('WeChat password change uses fresh bound identity proof and clears every local private view',async()=>{
+ const {app,page,wx,calls}=wechat(async options=>({statusCode:200,data:options.url.endsWith('/account/password')?{ok:true,signed_out:true}:{}}));
+ wx.login=options=>options.success({code:'fresh-once-code'});page.data.form={proof:1,new_password:'new-test-password',repeat_password:'new-test-password'};page.data.state={private:'old-health'};page.data.modal='security';
+ page.changePassword();await settled(page);
+ const sent=calls.find(c=>c.path.endsWith('/account/password'));assert.deepEqual(sent.data,{wechat_code:'fresh-once-code',new_password:'new-test-password'});
+ assert.equal(calls.some(c=>c.path.endsWith('/wechat/bind')),false);assert.equal(app.globalData.token,'');assert.equal(page.data.state,null);assert.equal(page.data.modal,'');assert.deepEqual(copy(page.data.form),{});
+});
+
+test('WeChat late fresh-proof callback cannot modify replacement account',async()=>{
+ const {app,page,wx,calls}=wechat(async()=>({statusCode:200,data:{}}));let finish;
+ wx.login=options=>{finish=options.success};page.data.form={proof:1,new_password:'new-test-password',repeat_password:'new-test-password'};
+ page.changePassword();for(let i=0;i<5&&!finish;i++)await new Promise(setImmediate);assert.ok(finish);
+ app.clearSession();app.globalData.token='replacement';finish({code:'old-proof-code'});await settled(page);
+ assert.equal(calls.some(c=>c.path.endsWith('/account/password')),false);assert.equal(app.globalData.token,'replacement');
+});
+
+test('WeChat recovery code is transient and closing or signing out removes it',async()=>{
+ const {page,app}=wechat(async()=>({statusCode:200,data:{code:'one-time-recovery-code'}}));page.data.form={password:'test-password'};
+ page.recoveryCode();await settled(page);assert.equal(page.data.form.code,'one-time-recovery-code');page.close();assert.deepEqual(copy(page.data.form),{});
+ page.data.form={code:'private-recovery-code'};app.clearSession();assert.deepEqual(copy(page.data.form),{});
+});
+
+test('WeChat comments use household command recovery and explicit selected event',async()=>{
+ const {page,calls}=wechat(async options=>({statusCode:200,data:options.url.endsWith('/action')?{id:'comment'}:snapshot()}));
+ page.data.form={event_id:'visible-event',text:'具体的感谢'};page.saveComment();await settled(page);
+ const sent=calls.find(c=>c.path.endsWith('/action'));assert.equal(sent.data.action,'feedback.comment');assert.deepEqual(sent.data.data,{event_id:'visible-event',text:'具体的感谢'});
+});
+
+test('WeChat optional template selection never sends hidden health dates',async()=>{
+ const {page,calls}=wechat(async options=>({statusCode:200,data:options.url.endsWith('/action')?{id:'task'}:snapshot()}));
+ page.data.state=snapshot();page.data.form={template_id:'1-1',assignee:0};page.createFromLibrary();await settled(page);
+ const sent=calls.find(c=>c.path.endsWith('/action'));assert.equal(sent.data.action,'task.from_library');assert.deepEqual(sent.data.data,{template_id:'1-1',assignee:'mom',due_date:null,confirmed:true});
+});
+
+test('WeChat backgrounding clears recovery code and password forms even without a family',async()=>{
+ const {page}=wechat(async()=>({statusCode:200,data:{}}));page.data.familyId='';page.data.modal='recovery-code';page.data.form={code:'private-code'};page.onHide();assert.equal(page.data.modal,'');assert.deepEqual(copy(page.data.form),{});
+ page.data.modal='security';page.data.form={password:'private-password'};page.onHide();assert.deepEqual(copy(page.data.form),{});
 });

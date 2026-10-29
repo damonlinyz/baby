@@ -58,7 +58,8 @@ def read(c,fid,user,id):
         invalidate(c,fid,row)
         # A read that reports invalidation must commit the payload removal.
         return {'id':id,'status':'invalid','payload':None}
-    return {'id':id,'status':'active','payload':row['payload'],'created_at':row['created_at'],'revision':row['revision']}
+    import ai_features
+    return {'id':id,'status':'active','payload':row['payload'],'created_at':row['created_at'],'revision':row['revision'],'enhancement':ai_features.enhanced(c,fid,user,id)}
 
 
 def generate(c,fid,user,force=False):

@@ -1,0 +1,41 @@
+name: Verify source
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PAYMENTS_ENABLED: '0'
+      WX_NOTIFY_ENABLED: '0'
+      WX_POSTER_ENABLED: '0'
+      AI_API_KEY: ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m unittest discover -s tests
+      - run: |
+          node --check app.js
+          node --check features.js
+          node --check clients/weapp/pages/main/main.js
+          node --check clients/weapp/pages/main/features.js
+          git diff --check
+      - name: Build source assets on manual request
+        if: github.event_name == 'workflow_dispatch'
+        run: python tools/release_bundle.py --output dist/release
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: baba-source
+          path: dist/release/

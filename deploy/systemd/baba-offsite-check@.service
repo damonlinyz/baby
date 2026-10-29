@@ -1,0 +1,17 @@
+[Unit]
+Description=Check local and remote Baba %i backup and send its health signal
+[Service]
+Type=oneshot
+User=baba
+Group=baba
+WorkingDirectory=/opt/baba
+EnvironmentFile=/etc/baba-backup/common.env
+EnvironmentFile=/etc/baba-backup/offsite-%i.env
+ExecStart=/usr/bin/python3 /opt/baba/backend/offsite.py check --db ${BABA_BACKUP_DB} --directory ${BABA_BACKUP_DIR} --kind %i --alert
+TimeoutStartSec=5min
+UMask=0077
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/baba/private /var/lib/baba/backups

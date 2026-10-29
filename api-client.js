@@ -12,5 +12,5 @@ const apiRecovery=RequestRecovery.create({
   }finally{clearTimeout(timer)}
  }
 });
-async function api(path,data){const result=await apiRecovery.request(path,data);if(result.csrf&&csrf!==result.csrf){csrf=result.csrf;apiRecovery.reset()}if(path==='/logout'||path==='/account/delete'){csrf='';apiRecovery.reset()}return result}
+async function api(path,data){const result=await apiRecovery.request(path,data);if(result.csrf&&csrf!==result.csrf){csrf=result.csrf;apiRecovery.reset()}if(['/logout','/account/delete','/account/password','/account/delete-wechat','/account/recover'].includes(path)){csrf='';apiRecovery.reset()}return result}
 function apiCommand(data,confirm){return apiRecovery.command(data,confirm)}

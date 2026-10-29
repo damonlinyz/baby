@@ -1,6 +1,6 @@
 """SQLite domain layer. Mutations run under BEGIN IMMEDIATE; callers supply authenticated actor."""
 import os,json,sqlite3,secrets,hashlib,hmac,time,datetime,contextlib
-import templates,dates,lifecycle,recurring,bag,reports,task_details,engagement,reminders,briefings,sharing,push_notifications
+import templates,dates,lifecycle,recurring,bag,reports,task_details,engagement,reminders,briefings,sharing,push_notifications,social,ai_features,content_library
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent.parent
 DB=Path(os.environ.get('BABA_DB',str(ROOT/'private'/'baba.sqlite3')))
@@ -64,6 +64,7 @@ def audit(c,fid,actor,type,body):
  if type in ('member.join','member.remove','member.leave','family.transferred'):
   sharing.invalidate_family(c,fid);briefings.invalidate_family(c,fid);push_notifications.invalidate_family(c,fid)
  if type=='health.consent.changed' and body.get('grantee') and body.get('scope') in ('health_read','baby_read'):briefings.invalidate_family(c,fid,body.get('grantee'))
+ if fid and (type in ('member.join','member.remove','member.leave','family.transferred') or type=='health.consent.changed'):social.clean(c,fid)
  c.execute('INSERT INTO events VALUES(?,?,?,?,?,?)',(uid(),fid,actor,type,dumps(body),now()))
 def member(c,fid,user,roles=None):
  m=c.execute('SELECT * FROM memberships WHERE family_id=? AND user_id=? AND active=1',(fid,user)).fetchone()
@@ -212,6 +213,9 @@ def cancel_member_approvals(c,fid,user):
 def delete_account(c,user,password):
  r=c.execute('SELECT password FROM users WHERE id=?',(user,)).fetchone()
  if not r or not password_ok(password,r['password']):raise Problem(403,'请重新输入账号密码以确认')
+ return delete_verified_account(c,user)
+
+def delete_verified_account(c,user):
  if c.execute("SELECT 1 FROM memberships WHERE user_id=? AND role='dad' AND active=1",(user,)).fetchone():raise Problem(409,'请先转交家庭统筹权限，再删除账号')
  attach_deletion_ledger(c)
  c.execute('INSERT OR IGNORE INTO deletion_log.tombstones VALUES(?,?)',(user,now()))
@@ -252,7 +256,7 @@ def erase_account(c,user):
    removed.add(t['id']);c.execute("DELETE FROM records WHERE kind='task' AND id=?",(t['id'],))
   else:
    t['pregnancy_id']=None;t['stage']=None;put(c,'task',t,row['family_id'])
- for kind in ('pregnancy','pregnancy_event','baby_event','outbox','appointment','baby','chat','consent','wechat_identity','notification_preferences','engagement_preferences','subscription','external_delivery','completion_fact','checkin','support_fact','ai_usage','transfer'):
+ for kind in ('pregnancy','pregnancy_event','baby_event','outbox','appointment','baby','chat','consent','wechat_identity','notification_preferences','engagement_preferences','subscription','external_delivery','completion_fact','checkin','support_fact','ai_usage','transfer','account_recovery','feedback','ai_preferences'):
   for obj in rows(c,kind):
    if obj.get('pregnancy_id') in owned or obj['id'] in owned or any(obj.get(k)==user for k in ('subject_id','owner','subject','grantee','user_id','from','to')):
     removed.add(obj['id']);c.execute('DELETE FROM records WHERE kind=? AND id=?',(kind,obj['id']))
@@ -272,6 +276,7 @@ def erase_account(c,user):
    if row['family_id'] in affected:c.execute('DELETE FROM records WHERE kind=? AND id=?',(kind,row['id']))
  for fid in affected:c.execute("UPDATE command_requests SET result='{}',invalidated=1 WHERE family_id=?",(fid,))
  c.execute('DELETE FROM requests WHERE user_id=?',(user,))
+ c.execute("DELETE FROM records WHERE kind='feedback' AND family_id IN (SELECT family_id FROM memberships WHERE user_id=?)",(user,))
  c.execute('DELETE FROM users WHERE id=?',(user,))
  return {'ok':True}
 
@@ -304,6 +309,8 @@ def snapshot(c,user,fid):
  order_ids={o['id'] for o in orders}
  refunds=[r for r in rows(c,'refund',fid) if r['order_id'] in order_ids]
  result={'calendar_date':str(today(f.get('timezone',dates.DEFAULT_TIMEZONE))),'user':profile(c,user),'role':me['role'],'family':f,'members':members,'tasks':tasks,'task_series':[task_details.decorate(s,knowledge) for s in rows(c,'task_series',fid) if me['role']!='member' or s['assignee']==user],'items':items,'deleted_items':[i for i in all_items if i.get('deleted')] if me['role']=='dad' else [],'pregnancy':p,'babies':babies,'pregnancies':[{'id':x['id'],'state':x['state'],'archived':x.get('archived',False)} for x in rows(c,'pregnancy',fid) if can_health(c,fid,user,x)] if me['role']!='member' else [],'appointments':appointments,'approvals':approvals,'knowledge':knowledge,'notifications':[n for n in rows(c,'notification',fid) if n['recipient']==user and can_view_notification(c,fid,user,n)], 'reminder_preferences':reminders.preferences(c,fid,user), 'consents':[g for g in rows(c,'consent',fid) if g['subject']==user],'orders':orders,'refunds':refunds,'entitlements':[e for e in rows(c,'entitlement',fid) if e['owner']==user or e.get('bound_family')==fid], 'transfers':[t for t in rows(c,'transfer',fid) if t['to']==user and t['status']=='pending' and t['expires_at']>now()], 'activities':[{'type':r['type'],'created_at':r['created']} for r in c.execute("SELECT type,created FROM events WHERE family_id=? AND type NOT LIKE 'health.%' ORDER BY created DESC LIMIT 15",(fid,))]}
+ result['ai_preferences']={'auto_briefing':ai_features.preferences(c,fid,user)['auto_briefing']}
+ result['feedback_feed']=social.feed(c,fid,user,result)
  result['weekly_report']=reports.build(result)
  result['engagement']=engagement.summary(c,fid,user,result)
  result['briefings']=briefings.metadata(c,fid,user)
@@ -502,6 +509,10 @@ def transition(c,fid,user,p,data):
 
 def mutate(c,user,fid,action,data):
  me=member(c,fid,user);role=me['role'];f=get(c,'family',fid)
+ if action=='task.from_library':return content_library.create(c,fid,user,data)
+ if action=='ai.briefing_preferences':return ai_features.save(c,fid,user,data)
+ if action=='ai_history.delete':return ai_features.delete_history(c,fid,user,data)
+ if action.startswith('feedback.'):return social.mutate(c,fid,user,action,data)
  if action.startswith('engagement.'):return engagement.mutate(c,fid,user,action,data)
  if action=='notification.subscribe':return push_notifications.subscribe(c,fid,user,data)
  if action=='notification.preferences':return reminders.save(c,fid,user,data)
@@ -734,5 +745,7 @@ def tick():
  with transaction() as c:
   for f in rows(c,'family'):
    fid=f['id'];expire_approvals(c,fid);recurring.sync(c,fid);process_outbox(c,fid)
-   reminders.schedule(c,fid);briefings.schedule(c,fid);reminders.deliver(c,fid);sharing.expire(c,fid)
+   reminders.schedule(c,fid);briefings.schedule(c,fid);reminders.deliver(c,fid);sharing.expire(c,fid);social.clean(c,fid)
+ with transaction() as c:ai_features.clean(c)
  push_notifications.dispatch()
+ ai_features.dispatch()

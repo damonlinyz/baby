@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily encrypted full backup replica
+[Timer]
+OnCalendar=*-*-* 03:30:00 Asia/Shanghai
+Persistent=true
+Unit=baba-offsite@full.service
+[Install]
+WantedBy=timers.target

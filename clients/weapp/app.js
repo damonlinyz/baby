@@ -39,7 +39,7 @@ App({
   const result=await this.client().request(path,data),g=this.globalData;
   if(result.session_token&&g.token!==result.session_token){g.token=result.session_token;wx.setStorageSync('baba-session',g.token);this.client().reset()}
   if(result.csrf){g.csrf=result.csrf;wx.setStorageSync('baba-csrf',g.csrf)}
-  if(path==='/logout'||path==='/account/delete')this.clearSession();
+  if(['/logout','/account/delete','/account/password','/account/delete-wechat','/account/recover'].includes(path))this.clearSession();
   return result;
  },
  command(data,confirm){return this.client().command(data,confirm)},
