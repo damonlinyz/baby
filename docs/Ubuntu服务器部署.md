@@ -2,7 +2,7 @@
 
 本轮按用户提供的服务器信息准备：Ubuntu 24.04、约 8 GiB 内存，约 6.3 GiB 可用；40 GB 根盘剩余约 7.8 GB。已有 Caddy 监听 80/443，Docker 暴露 8081 和本机 5432，Ollama 监听 11434。不能把它当作空服务器，也不能通过清理 Docker、模型或覆盖 Caddy 来腾空间。
 
-独立服务域名采用 `baba.onedrivememory.com`，A 记录指向用户的服务器。用户截图已显示记录启用；这不等于已核验公网 DNS、HTTPS 或应用可用。下载页继续留在 GitHub Pages，安装包留在 Releases。
+独立服务域名采用 `baba.onedrivememory.com`，A 记录指向用户的服务器。用户截图已显示记录启用，之后回传的安装输出确认本机后端安装和健康检查通过，版本为 `3e1fb985a0bd7df8b85cfb69ded0ea40fe4b95ed`。这些证据不等于公网 HTTPS 已接通；下载页继续留在 GitHub Pages，安装包留在 Releases。
 
 ## 第一步：仅本机安装
 
@@ -49,7 +49,31 @@ systemctl show --property=ExecStart --value caddy.service
 
 ## 第二步：接入已有 Caddy
 
-先确认域名实际解析到服务器，再核对 `caddy.service` 正在使用的配置文件和格式。当前只知道进程存在，尚未读取或修改其配置；不要假设它一定使用 `/etc/caddy/Caddyfile`，也不要用新的整份配置替换原网站。
+用户回传的 `ExecStart` 已确认服务使用 `/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile`。现在使用独立工具 `tools/server_proxy.py` 接入，不重装 App、不升级 `/opt/baba`、不修改数据库。工具同样保存到服务器后再执行，使用提供的固定提交网址和 SHA-256 校验，不从可变分支直接执行 root 管道脚本。
+
+```sh
+# 默认只预览，不检查网络也不修改系统。
+python3 /root/baba-server-proxy.py \
+  --domain baba.onedrivememory.com --address 163.7.5.202
+
+# 明确执行 DNS / 服务检查、备份、完整验证和重载。
+python3 /root/baba-server-proxy.py \
+  --domain baba.onedrivememory.com --address 163.7.5.202 --apply
+
+# 后续只读复验，不重新修改或重载配置。
+python3 /root/baba-server-proxy.py \
+  --domain baba.onedrivememory.com --address 163.7.5.202 --verify
+```
+
+实际执行前要求：
+
+- root 账号；配置及父目录是受保护的 root 普通路径；App 和 Caddy 已运行。
+- 进程启动配置路径、已安装 App 的公共域名与命令一致。
+- 域名解析结果恰为指定公网 IPv4；未核对的 AAAA/CDN 记录或 DNS 尚未生效会停止，不自动改 DNS。
+- 本机 `/api/health` 成功，且现有完整 Caddyfile 能转换为配置。
+- 不存在同名非本工具管理的站点或片段，避免覆盖现有业务。
+
+工具先保存原文件到 `/etc/caddy/Caddyfile.before-baba-日期-随机后缀`，权限 `0600`，原配置可能含凭据，因此备份也不应发送或提交 Git。新站点放在 `/etc/caddy/baba-app.caddy`，候选配置完整保留原字节，再添加独立 import。以实际服务账号验证候选完整配置，验证通过且原文件未被并发修改后才原子替换、`systemctl reload caddy.service`。不会 restart 服务或改动其他系统服务。
 
 生成片段为独立站点：
 
@@ -63,7 +87,9 @@ baba.onedrivememory.com {
 }
 ```
 
-核对实际配置后，备份原文件，将该独立站点片段以只读文件加入现有配置；确保没有同名站点且没有落入其他站点的大括号中。先执行 Caddy 对完整配置的验证，通过后才 reload。失败时恢复原文件并保留当前正常运行的配置，不 restart 其他服务。使用 Caddy 自动 HTTPS 前需确保此服务器现有 80/443 入口、安全组及域名解析满足证书签发条件；不额外开放 8766。
+候选验证失败不会重载；重载失败会恢复原文件、移除新片段并重载原配置。若恢复本身失败，会明确输出备份位置并要求在服务器核对，不声称恢复成功。并发修改不会被盲目覆盖。重复执行已核对的同一托管片段不会重复添加 import；发现陌生片段则拒绝覆盖。
+
+成功应用返回 `mode=configured`、`proxy=reloaded`。**只有 `https=passed` 才表示本次 HTTPS 健康检查也通过。** Caddy 签发证书有时需要等待；`pending` 保留已验证的配置，稍后用 `--verify` 复查。验证保持 TLS 证书校验，不使用 `curl -k`；服务端出口回环不通也可能导致服务器自检失败，需要另从浏览器或独立网络复验。使用自动 HTTPS 需确保现有 80/443 入口、安全组及域名解析满足证书签发条件；不额外开放 8766。
 
 当前应用直接看到反向代理的本机地址，部分按 IP 的限流会聚合代理后的用户。不能通过无条件信任 `X-Forwarded-For` 来修补；大范围对外开放前需独立实现可信代理边界、访问压力与限流验证。本轮首先用于自用部署准备，不宣称完成公众生产验收。
 
@@ -79,7 +105,11 @@ baba.onedrivememory.com {
 
 ```sh
 python -m unittest discover -s tests -p test_server_install.py -v
+python -m unittest discover -s tests -p test_server_proxy.py -v
 python tools/server_install.py --revision 完整提交SHA --domain baba.onedrivememory.com
+python tools/server_proxy.py --domain baba.onedrivememory.com --address 163.7.5.202
 ```
 
-测试在临时目录模拟账号、命令、源码和健康检查，验证计划不写系统、拒绝注入与覆盖、固定提交、异常停止和数据保留；没有在工作环境执行真实 root 安装，也没有连接用户服务器。systemd 单元另外进行语法检查。实际服务安装、DNS/HTTPS、真实备份和恢复以服务器后续输出为准。
+测试在临时目录模拟账号、命令、源码和健康检查，验证计划不写系统、拒绝注入与覆盖、固定提交、异常停止和数据保留。HTTPS 工具另有失败回滚、二次恢复失败、并发编辑保留、重复接入、DNS/AAAA 不匹配、待签发和只读复验测试。原站点加新 App 的组合配置用官方 Caddy 2.10.2 实际校验通过，下载二进制前核对了 GitHub 发布摘要，没有启动监听服务。systemd 单元也进行语法检查。
+
+工作环境没有直接登录用户服务器；用户已经通过控制台完成第一次 App 安装，本轮提供的 HTTPS 接入脚本还需用户执行。实际公网 HTTPS、真实备份和恢复以服务器后续输出为准，模拟命令测试不冒充远端运维成功。

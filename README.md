@@ -22,7 +22,7 @@ PYTHONDONTWRITEBYTECODE=1 PORT=8766 python3 backend/server.py
 
 数据库自动建立在 `private/baba.sqlite3`，并创建独立的 `private/baba.sqlite3.deletions.sqlite3` 删除记录，该目录已排除在 Git 之外。不要将数据库、密码、模型密钥或支付证书上传到仓库。保存重要资料前自行做好备份；当前 SQLite 数据没有应用层字段加密。
 
-Ubuntu 24.04 首次部署可使用 `tools/server_install.py`，默认仅预览，显式 `--apply` 才安装固定提交的本机服务；不会覆盖现有目录或修改已有 Caddy、Docker 和防火墙。HTTPS 接入与备份需另外完成，步骤见 [Ubuntu 服务器部署](docs/Ubuntu服务器部署.md)。
+Ubuntu 24.04 首次部署可使用 `tools/server_install.py`，默认仅预览，显式 `--apply` 才安装固定提交的本机服务；不会覆盖现有目录或修改已有 Caddy、Docker 和防火墙。已有本机服务可使用 `tools/server_proxy.py` 检查 DNS、备份/验证并接入现有 Caddy，支持失败回滚和只读 HTTPS 复验。备份仍需另外配置，步骤见 [Ubuntu 服务器部署](docs/Ubuntu服务器部署.md)。
 
 ## 已编写的功能
 
