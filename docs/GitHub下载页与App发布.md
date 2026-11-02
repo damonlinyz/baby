@@ -11,7 +11,7 @@
 | GitHub Pages | 提供产品介绍、下载按钮、安装说明、更新记录与文件核对 |
 | 应用后端 | 另行部署账号、家庭数据、协作与同步；Pages 不运行 Python/SQLite 后端 |
 
-当前目标公开网址是 **https://damonlinyz.github.io/baby/**。仓库检查时 `has_pages=false`，需要先在 GitHub 设置中启用 Pages；此地址不能在启用和部署成功前宣称已经上线。
+公开网址是 **https://damonlinyz.github.io/baby/**。首次部署因 Pages 未启用失败；用户随后启用 Pages，第二次运行已完成部署，GitHub 返回上述网址。此状态来自部署记录，不代表真实 App 安装包或家庭后端已经上线。
 
 ## 下载页面
 

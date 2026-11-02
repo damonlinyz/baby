@@ -22,6 +22,8 @@ PYTHONDONTWRITEBYTECODE=1 PORT=8766 python3 backend/server.py
 
 数据库自动建立在 `private/baba.sqlite3`，并创建独立的 `private/baba.sqlite3.deletions.sqlite3` 删除记录，该目录已排除在 Git 之外。不要将数据库、密码、模型密钥或支付证书上传到仓库。保存重要资料前自行做好备份；当前 SQLite 数据没有应用层字段加密。
 
+Ubuntu 24.04 首次部署可使用 `tools/server_install.py`，默认仅预览，显式 `--apply` 才安装固定提交的本机服务；不会覆盖现有目录或修改已有 Caddy、Docker 和防火墙。HTTPS 接入与备份需另外完成，步骤见 [Ubuntu 服务器部署](docs/Ubuntu服务器部署.md)。
+
 ## 已编写的功能
 
 - 账号注册、登录、会话、CSRF 校验，家庭成员、一次性邀请、角色权限。
@@ -56,7 +58,7 @@ PYTHONDONTWRITEBYTECODE=1 PORT=8766 python3 backend/server.py
 
 独立下载页位于 `website/`，由 `download-pages.yml` 部署到 GitHub Pages，下载指向 GitHub Releases 中的真实签名 APK。没有安装包时显示“尚未发布”，不会把源码 ZIP 当作 App。
 
-目标地址为 `https://damonlinyz.github.io/baby/`，需先在仓库 Settings → Pages 将 Source 设为 GitHub Actions，再运行部署。当前仓库没有正式 Release APK；下载页、安装包与后端服务分别部署，GitHub Pages 不托管家庭数据库。完整步骤见 [GitHub 下载页与 App 发布](docs/GitHub下载页与App发布.md)。
+下载页已通过 Pages 部署，地址为 `https://damonlinyz.github.io/baby/`。当前仓库没有正式 Release APK；下载页、安装包与后端服务分别部署，GitHub Pages 不托管家庭数据库。完整步骤见 [GitHub 下载页与 App 发布](docs/GitHub下载页与App发布.md)。
 
 ## 客户端与渠道
 
