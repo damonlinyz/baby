@@ -1,0 +1,7 @@
+{
+  "repository": "damonlinyz/baby",
+  "android_asset": "baba-android.apk",
+  "android_package": null,
+  "android_signer_sha256": null,
+  "minimum_android_version_code": 202
+}

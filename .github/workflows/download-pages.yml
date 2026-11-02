@@ -1,0 +1,67 @@
+name: Publish download page
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - 'tools/download_site.py'
+      - 'tools/release_bundle.py'
+      - 'tests/test_download_site.py'
+      - 'tests/client_download_page.test.cjs'
+      - '.github/workflows/download-pages.yml'
+  release:
+    types: [published, edited, deleted]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: download-pages
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: github.event_name != 'release' || (github.event.release.draft == false && github.event.release.prerelease == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test download and publication gates
+        run: |
+          python -m unittest discover -s tests -p test_download_site.py
+          node tests/client_download_page.test.cjs
+      - name: Locate Android SDK verification tools
+        run: |
+          python - <<'PYSDK'
+          import os
+          from pathlib import Path
+          sdk=Path(os.environ.get('ANDROID_HOME','/usr/local/lib/android/sdk'))/'build-tools'
+          available=[p for p in sdk.glob('*') if (p/'apksigner').is_file() and (p/'aapt').is_file()]
+          if available:
+              chosen=sorted(available,key=lambda p:tuple(int(s) if s.isdigit() else 0 for s in p.name.replace('-','.').split('.')))[-1]
+              with open(os.environ['GITHUB_PATH'],'a') as stream:stream.write(str(chosen)+'\n')
+          else:
+              print('Android SDK unavailable: a real APK release will fail closed; a no-release page can still build.')
+          PYSDK
+      - name: Build public files and validate stable release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python tools/download_site.py --github --output dist/download-page
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/download-page
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -15,6 +15,11 @@
 *.pfx
 *.keystore
 *.jks
+*.apk
+*.aab
+*.ipa
+*.dmg
+*.exe
 *.cms
 *.tar
 *credentials*.json

@@ -29,6 +29,7 @@ jobs:
           node --check app.js
           node --check features.js
           node --check service-features.js
+          node --check website/site.js
           node --check clients/weapp/pages/main/main.js
           node --check clients/weapp/pages/main/features.js
           git diff --check

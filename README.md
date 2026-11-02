@@ -52,6 +52,12 @@ PYTHONDONTWRITEBYTECODE=1 PORT=8766 python3 backend/server.py
 - 加密备份任务、完整/删除记录独立保留、过期和失败检查、解密与删除重放演练；提供尚未安装的 systemd 定时模板。
 - 重复买断收款不重复发权益或赠送 AI，自动建立待核验售后单；本人订单/售后状态、网页系统管理员退款核对和查询入口。规则见 [重复收款处理](docs/支付重复收款处理.md)。
 
+## GitHub 下载页与 App 发布
+
+独立下载页位于 `website/`，由 `download-pages.yml` 部署到 GitHub Pages，下载指向 GitHub Releases 中的真实签名 APK。没有安装包时显示“尚未发布”，不会把源码 ZIP 当作 App。
+
+目标地址为 `https://damonlinyz.github.io/baby/`，需先在仓库 Settings → Pages 将 Source 设为 GitHub Actions，再运行部署。当前仓库没有正式 Release APK；下载页、安装包与后端服务分别部署，GitHub Pages 不托管家庭数据库。完整步骤见 [GitHub 下载页与 App 发布](docs/GitHub下载页与App发布.md)。
+
 ## 客户端与渠道
 
 | 客户端 | 源码 | 状态 |
